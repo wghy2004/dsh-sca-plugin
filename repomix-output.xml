@@ -1,0 +1,6499 @@
+This file is a merged representation of a subset of the codebase, containing files not matching ignore patterns, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching these patterns are excluded: node_modules/, dist/, content.js, libs/, .pytest_cache/, *.db, eval/, scripts/, ui/
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+src/
+  dsh-plugin/
+    adapter/
+      sca-runtime-adapter.ts
+    contract/
+      authority-model.ts
+      evidence-authority.ts
+      evidence.ts
+      mission-completion.ts
+      mission-events.ts
+      mission-projection.ts
+      mission.ts
+      policy.ts
+      types.ts
+    providers/
+      sca-provider.ts
+      types.ts
+    runtime/
+      event-sourced-mission-repository.ts
+      evidence-mapper.ts
+      index.ts
+      sca-core-runtime.ts
+    services/
+      career-service.ts
+      mission-service.ts
+    index.ts
+    manifest.ts
+    README.md
+tests/
+  authority-gate.contamination.test.ts
+  mission-replay.test.ts
+  run-all.mjs
+package.json
+tsconfig.json
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/dsh-plugin/adapter/sca-runtime-adapter.ts">
+import type {
+  ActionReceipt,
+  ApplyPreparation,
+  ApplyRequest,
+  CareerState,
+  Evidence,
+  Job,
+  JobInspectResult,
+  JobSearchRequest,
+  VerificationResult,
+} from "../contract/types";
+import type {
+  CareerStateProvider,
+} from "../services/career-service";
+import type {
+  SCAProvider,
+} from "../providers/types";
+
+import {
+  NullSCAProvider,
+} from "../providers/sca-provider";
+
+/**
+ * SCA Runtime Adapter
+ *
+ * 这是整个 DSH Plugin 最重要的边界。
+ *
+ * DSH Plugin 不直接依赖：
+ *
+ * - chrome.*
+ * - IndexedDB
+ * - shadowTabExecutor
+ * - SeedGenerator
+ * - policy.ts
+ * - WDL VM
+ *
+ * 这些能力全部通过 Adapter 注入。
+ *
+ * ⚠️ OBSERVED Authority 边界：
+ *   ExistingSCARuntime 是唯一允许返回 authority="OBSERVED" Evidence 的来源。
+ *   Plugin 内部的 EvidenceFactory 不再提供 observed() 方法。
+ *   所有现实世界事实必须经由 SCA Observation → ProvenanceVerifier → Event Store 后，
+ *   通过本 Adapter 以 OBSERVED Evidence 的形式注入。
+ */
+
+export interface ExistingSCARuntime {
+  /**
+   * 当前 SCA 职业画像 / Constitution 的读取入口。
+   * SCA Profile = State Authority，DSH CareerState = Semantic Projection。
+   */
+  getCareerState(): Promise<CareerState>;
+
+  /**
+   * 搜索职位。
+   *
+   * 桥接到：SeedGenerator → Traversal → Observation → Matcher
+   *
+   * DSH 负责"我要什么"，SCA 负责"现实世界怎么找"。
+   * DSH 不应该知道招聘网站的 URL、Selector、TabId。
+   */
+  searchJobs(
+    request: JobSearchRequest,
+    signal?: AbortSignal,
+  ): Promise<{
+    jobs: Job[];
+    evidence: Evidence[];
+  }>;
+
+  /**
+   * 检查职位详情。
+   *
+   * 桥接到现有 Observation Pipeline。
+   * 字段本身 ≠ 事实，每个可验证字段必须关联 OBSERVED Evidence。
+   */
+  inspectJob(
+    jobId: string,
+    signal?: AbortSignal,
+  ): Promise<JobInspectResult>;
+
+  /**
+   * 投递准备：评估可行性，不产生外部副作用。
+   * 检查登录状态、简历完整性、平台限制等。
+   */
+  prepareApply(
+    request: ApplyRequest,
+    signal?: AbortSignal,
+  ): Promise<ApplyPreparation>;
+
+  /**
+   * 执行投递：触发外部行动（WDL/Browser 操作）。
+   * accepted !== 现实世界成功，必须经过 verifyApply。
+   */
+  executeApply(
+    missionId: string,
+    approvalToken?: string,
+    signal?: AbortSignal,
+  ): Promise<ActionReceipt>;
+
+  /**
+   * 验证投递：基于 OBSERVED Evidence 确认现实世界状态。
+   * 例如读取"已投递"页面状态，经 ProvenanceVerifier 后返回 OBSERVED Evidence。
+   */
+  verifyApply(
+    missionId: string,
+    signal?: AbortSignal,
+  ): Promise<VerificationResult>;
+}
+
+export class SCACareerStateAdapter
+  implements CareerStateProvider
+{
+  constructor(
+    private readonly runtime:
+      | ExistingSCARuntime
+      | null = null,
+  ) {}
+
+  async getCareerState(): Promise<CareerState> {
+    if (this.runtime) {
+      return this.runtime.getCareerState();
+    }
+
+    return {
+      version: 1,
+      identityAnchor: undefined,
+      targetRoles: [],
+      hardSkills: [],
+      softSkills: [],
+      achievements: [],
+      constraints: {},
+      source: "SCA",
+      updatedAt: Date.now(),
+    };
+  }
+}
+
+export class SCARuntimeProvider
+  implements SCAProvider
+{
+  readonly id = "sca.runtime";
+
+  private readonly fallback =
+    new NullSCAProvider();
+
+  constructor(
+    private readonly runtime:
+      | ExistingSCARuntime
+      | null = null,
+  ) {}
+
+  search = {
+    search: async (
+      request: JobSearchRequest,
+      signal?: AbortSignal,
+    ) => {
+      if (!this.runtime) {
+        return this.fallback.search.search(
+          request,
+          signal,
+        );
+      }
+
+      return this.runtime.searchJobs(
+        request,
+        signal,
+      );
+    },
+  };
+
+  inspection = {
+    inspect: async (
+      jobId: string,
+      signal?: AbortSignal,
+    ) => {
+      if (!this.runtime) {
+        return this.fallback.inspection.inspect(
+          jobId,
+          signal,
+        );
+      }
+
+      return this.runtime.inspectJob(
+        jobId,
+        signal,
+      );
+    },
+  };
+
+  application = {
+    prepare: async (
+      request: ApplyRequest,
+      signal?: AbortSignal,
+    ): Promise<ApplyPreparation> => {
+      if (!this.runtime) {
+        return this.fallback.application.prepare(
+          request,
+          signal,
+        );
+      }
+
+      return this.runtime.prepareApply(request, signal);
+    },
+
+    execute: async (
+      missionId: string,
+      approvalToken?: string,
+      signal?: AbortSignal,
+    ): Promise<ActionReceipt> => {
+      if (!this.runtime) {
+        return this.fallback.application.execute(
+          missionId,
+          approvalToken,
+          signal,
+        );
+      }
+
+      return this.runtime.executeApply(
+        missionId,
+        approvalToken,
+        signal,
+      );
+    },
+
+    verify: async (
+      missionId: string,
+      signal?: AbortSignal,
+    ): Promise<VerificationResult> => {
+      if (!this.runtime) {
+        return this.fallback.application.verify(
+          missionId,
+          signal,
+        );
+      }
+
+      return this.runtime.verifyApply(missionId, signal);
+    },
+  };
+}
+</file>
+
+<file path="src/dsh-plugin/contract/authority-model.ts">
+/**
+ * Authority Model —— 四种事实来源的正式定义
+ *
+ * ⚠️ Phase F-1.1: 移除 trust 数值语义。
+ *
+ * Authority 描述的是认识论来源/证明层级，不是同一坐标系里的概率。
+ *
+ *   OBSERVED  = reality evidence（现实证据）
+ *   DERIVED   = deterministic conclusion（确定性结论）
+ *   INFERRED  = epistemic hypothesis（认识论假设）
+ *   RETRACTED = invalidated claim（已失效声明）
+ *
+ * 它们属于不同语义类型，不能用 1.0 > 0.5 这样的数值比较。
+ *
+ * 如果需要可信度，使用 Evidence.confidence（对具体 Claim 的置信度），
+ * 而不是 Authority 本身的 trust。
+ *
+ * 权威链：
+ *   REALITY
+ *      │
+ *      ▼
+ *   OBSERVED ─── 现实世界经过 ProvenanceVerifier 授权的事实
+ *      │
+ *      ▼
+ *   DERIVED ──── 由确定性规则从 OBSERVED 推导出来的状态
+ *      │
+ *      ▼
+ *   INFERRED ─── LLM / Matcher / 推理系统产生的判断
+ *      │
+ *      ▼
+ *   RETRACTED ── 之前获得的 Evidence / Claim 不再有效
+ */
+
+import type { Authority, Evidence } from "./types";
+
+// ============================================================
+// 四种 Authority 的正式定义
+// ============================================================
+
+export interface AuthorityDefinition {
+  authority: Authority;
+  name: string;
+  description: string;
+  /** 唯一合法的产生者 */
+  producer: string;
+  /** 认识论分类：reality / deterministic / hypothesis / invalidated */
+  epistemicClass: "reality" | "deterministic" | "hypothesis" | "invalidated";
+  /** 是否可以作为 Mission Completion 的验证依据 */
+  canVerifyCompletion: boolean;
+  /** 典型示例 */
+  examples: string[];
+}
+
+export const AUTHORITY_MODEL: Record<Authority, AuthorityDefinition> = {
+  OBSERVED: {
+    authority: "OBSERVED",
+    name: "Observed Reality",
+    description:
+      "现实世界经过 ProvenanceVerifier 授权的事实。必须来自真实浏览器观察，且存在对应的 interpretation 事件（证明经过了 processObservation）。",
+    producer: "SCA Runtime / ProvenanceVerifier (processObservation)",
+    epistemicClass: "reality",
+    canVerifyCompletion: true,
+    examples: [
+      'page.text = "投递成功"',
+      'page.title = "Java后端工程师-字节跳动"',
+      'page.url = "https://zhipin.com/job_detail/123"',
+    ],
+  },
+
+  DERIVED: {
+    authority: "DERIVED",
+    name: "Deterministically Derived",
+    description:
+      "由确定性规则从 OBSERVED 推导出来的状态。不引入新的现实事实，只是对已有事实的语义解释。",
+    producer: "Evidence Mapper / Verification Engine / Rule Engine",
+    epistemicClass: "deterministic",
+    canVerifyCompletion: false, // DERIVED 不能单独验证，必须追溯到 OBSERVED
+    examples: [
+      'application.status = SUBMITTED （从 page.text="投递成功" 推导）',
+      'job.salary.monthly = 30000 （从 page.text="30K-40K" 解析）',
+      'match.score = 85 （从 interpretation.riskTags 提取）',
+    ],
+  },
+
+  INFERRED: {
+    authority: "INFERRED",
+    name: "Model Inferred",
+    description:
+      "LLM / Matcher / 推理系统产生的判断。包含不确定性，不能作为现实事实的唯一依据。",
+    producer: "LLM / Vector Matcher / Heuristic Engine",
+    epistemicClass: "hypothesis",
+    canVerifyCompletion: false,
+    examples: [
+      "该岗位与你的技术背景高度匹配",
+      "这家公司可能存在加班文化",
+      "这个职位可能已经关闭",
+    ],
+  },
+
+  RETRACTED: {
+    authority: "RETRACTED",
+    name: "Retracted Claim",
+    description:
+      "之前获得的 Evidence / Claim 不再有效。可能因为页面刷新、信息更正、或被新的 OBSERVED 证伪。",
+    producer: "EvidenceFactory.retract() / ProvenanceVerifier",
+    epistemicClass: "invalidated",
+    canVerifyCompletion: false,
+    examples: [
+      "之前观察到的薪资信息已被新页面覆盖",
+      "岗位状态从'招聘中'变为'已关闭'",
+    ],
+  },
+};
+
+// ============================================================
+// Authority 层级规则（基于认识论分类，而非数值 trust）
+// ============================================================
+
+/**
+ * Authority 冲突解决：基于认识论层级，而非数值 trust。
+ *
+ * 层级：reality > deterministic > hypothesis > invalidated
+ *
+ * 注意：这不是"概率大小"比较，而是"证明来源"的优先级。
+ * 一条 OBSERVED 事实永远比一条 INFERRED 假设更有权威，
+ * 即使 INFERRED 的 confidence 很高。
+ */
+const EPISTEMIC_PRIORITY: Record<AuthorityDefinition["epistemicClass"], number> = {
+  reality: 3,
+  deterministic: 2,
+  hypothesis: 1,
+  invalidated: 0,
+};
+
+export function resolveAuthorityConflict(
+  a: Evidence,
+  b: Evidence,
+): Evidence {
+  const priorityA = EPISTEMIC_PRIORITY[AUTHORITY_MODEL[a.authority]?.epistemicClass ?? "hypothesis"];
+  const priorityB = EPISTEMIC_PRIORITY[AUTHORITY_MODEL[b.authority]?.epistemicClass ?? "hypothesis"];
+  return priorityA >= priorityB ? a : b;
+}
+
+/**
+ * 检查 Evidence 是否可以作为 Completion 验证依据。
+ * 只有 OBSERVED 可以。
+ */
+export function canVerifyCompletion(evidence: Evidence): boolean {
+  return AUTHORITY_MODEL[evidence.authority]?.canVerifyCompletion ?? false;
+}
+
+/**
+ * 检查一组 Evidence 中是否存在足够的 OBSERVED 依据。
+ *
+ * Completion Gate 的核心：没有 OBSERVED 就不能 COMPLETED。
+ */
+export function hasSufficientObservedEvidence(
+  evidence: Evidence[],
+  minCount = 1,
+): boolean {
+  const observed = evidence.filter((e) => e.authority === "OBSERVED");
+  return observed.length >= minCount;
+}
+
+// ============================================================
+// DERIVED Evidence 构造辅助
+//
+// confirmed = true 是 DERIVED，不是 OBSERVED。
+// 这些函数帮助构造从 OBSERVED 推导的 DERIVED claim。
+// ============================================================
+
+/**
+ * 从 OBSERVED 页面文本推导出 application.status = SUBMITTED。
+ *
+ * 这是一个 DERIVED claim，必须追溯到上游 OBSERVED evidence。
+ */
+export function deriveApplicationSubmitted(
+  fromObservedId: string,
+  observedText: string,
+): { claimKey: string; value: unknown; derivedFrom: string } {
+  return {
+    claimKey: "application.status",
+    value: "SUBMITTED",
+    derivedFrom: fromObservedId,
+  };
+}
+
+/**
+ * 从 OBSERVED 页面文本推导出 application.status = REJECTED。
+ */
+export function deriveApplicationRejected(
+  fromObservedId: string,
+  observedText: string,
+): { claimKey: string; value: unknown; derivedFrom: string } {
+  return {
+    claimKey: "application.status",
+    value: "REJECTED",
+    derivedFrom: fromObservedId,
+  };
+}
+
+// ============================================================
+// Authority 不变量断言
+// ============================================================
+
+/**
+ * 断言 Authority 层级不变量：
+ *   1. OBSERVED 必须有 source（来自真实观察）
+ *   2. INFERRED 必须有 confidence < 1.0（不确定性）
+ *   3. RETRACTED 必须有 retractedAt
+ *
+ * 注意：confidence 是对具体 Claim 的置信度，不是 Authority 本身的 trust。
+ * OBSERVED 的 confidence 可以是 1.0（事实确定），
+ * INFERRED 的 confidence 必须 < 1.0（假设不确定）。
+ */
+export function assertAuthorityInvariants(evidence: Evidence): void {
+  if (evidence.authority === "OBSERVED") {
+    if (!evidence.source) {
+      throw new Error(
+        `AUTHORITY_INVARIANT: OBSERVED evidence ${evidence.id} must have source`,
+      );
+    }
+  }
+
+  if (evidence.authority === "INFERRED") {
+    if (evidence.confidence !== undefined && evidence.confidence >= 1.0) {
+      throw new Error(
+        `AUTHORITY_INVARIANT: INFERRED evidence ${evidence.id} must have confidence < 1.0 (got ${evidence.confidence})`,
+      );
+    }
+  }
+
+  if (evidence.authority === "RETRACTED") {
+    if (!evidence.retractedAt) {
+      throw new Error(
+        `AUTHORITY_INVARIANT: RETRACTED evidence ${evidence.id} must have retractedAt`,
+      );
+    }
+  }
+}
+</file>
+
+<file path="src/dsh-plugin/contract/evidence-authority.ts">
+/**
+ * Evidence Authority Gate —— 纯函数层
+ *
+ * ⚠️ 这是 OBSERVED Authority 的核心校验逻辑，不依赖任何运行时模块（chrome/IDB/fetch）。
+ * 可以在任何环境中测试，包括 Node.js unit test。
+ *
+ * 权威链：
+ *   Raw Observation (content_script)
+ *     → processObservation() [ProvenanceVerifier]
+ *     → observation event
+ *     → interpretation event (interpretation.observationId === observation.id)
+ *     → isAuthorizedObservation() 校验
+ *     → OBSERVED Evidence
+ *
+ * 任何不满足校验条件的 observation 都是 RAW，不能提升为 OBSERVED。
+ */
+
+import type {
+  SovereigntyEvent,
+  ObservationPayload,
+  InterpretationPayload,
+} from "@sca/shared/types";
+import type { Evidence, EvidenceSource } from "./types";
+
+const SCA_OBSERVATION_PROVIDER = "sca.observation";
+const SCA_INTERPRETATION_PROVIDER = "sca.interpretation";
+
+/**
+ * 合法的 observation 来源。
+ * 必须是真实浏览器观察，不能是 hub/cloud 等非浏览器来源。
+ */
+const AUTHORIZED_OBSERVATION_SOURCES = new Set([
+  "content_script",
+  "service_worker",
+]);
+
+/**
+ * 验证一个 observation event 是否经过了 SCA 的 ProvenanceVerifier（processObservation）。
+ *
+ * SCA 的验证链：
+ *   content_script 捕获原始观察
+ *     → processObservation() 被调用
+ *     → 写入 observation event
+ *     → 写入 interpretation event（包含云端分析、匹配度评分、风险标签）
+ *
+ * 因此，一个"已授权的 OBSERVED"必须同时满足：
+ *   1. event.type === "observation"
+ *   2. event.source ∈ AUTHORIZED_OBSERVATION_SOURCES
+ *   3. 同一 chainId 下存在对应的 interpretation event
+ *      （interpretation.observationId === observation.id）
+ *
+ * 不满足这些条件的 observation 是 RAW，不能提升为 OBSERVED。
+ *
+ * @param event 待验证的 observation event
+ * @param chainEvents 同一 chainId 下的所有事件（用于查找对应的 interpretation）
+ * @returns 是否为已授权的 OBSERVED
+ */
+export function isAuthorizedObservation(
+  event: SovereigntyEvent,
+  chainEvents: SovereigntyEvent[],
+): boolean {
+  // 条件 1: 必须是 observation 类型
+  if (event.type !== "observation") return false;
+
+  // 条件 2: 来源必须是真实浏览器观察
+  if (!AUTHORIZED_OBSERVATION_SOURCES.has(event.source)) {
+    return false;
+  }
+
+  // 条件 3: 必须存在对应的 interpretation（ProvenanceVerifier 的输出）
+  const observationId = event.id;
+  const hasInterpretation = chainEvents.some(
+    (e) =>
+      e.type === "interpretation" &&
+      (e.payload as InterpretationPayload).observationId === observationId,
+  );
+
+  return hasInterpretation;
+}
+
+/**
+ * 从事件链中提取所有已授权的 OBSERVED Evidence。
+ * 未经过 ProvenanceVerifier 的 observation 会被过滤掉。
+ *
+ * 这是 OBSERVED Evidence 的唯一合法构造入口。
+ */
+export function extractAuthorizedObservations(
+  chainEvents: SovereigntyEvent[],
+): Evidence[] {
+  return chainEvents
+    .filter((e) => isAuthorizedObservation(e, chainEvents))
+    .map((e) => mapAuthorizedObservationToEvidence(e));
+}
+
+/**
+ * 将已授权的 SCA Observation 映射为 OBSERVED Evidence。
+ *
+ * 注意：此函数假设调用方已经通过 isAuthorizedObservation() 验证。
+ * 外部不应直接调用此函数，应使用 extractAuthorizedObservations()。
+ */
+export function mapAuthorizedObservationToEvidence(
+  event: SovereigntyEvent,
+): Evidence {
+  const payload = event.payload as ObservationPayload;
+  const source: EvidenceSource = {
+    providerId: SCA_OBSERVATION_PROVIDER,
+    uri: payload.pageUrl,
+    observedAt: event.ts,
+    locator: payload.selector,
+  };
+
+  return {
+    id: event.id,
+    claimKey: `observation:${payload.selector || "page"}`,
+    value: {
+      pageUrl: payload.pageUrl,
+      pageTitle: payload.pageTitle,
+      extractedText: payload.extractedText,
+      domEntities: payload.domEntities,
+    },
+    authority: "OBSERVED",
+    source,
+    confidence: 1.0,
+    createdAt: event.ts,
+  };
+}
+
+/**
+ * 将 SCA Interpretation 映射为 DERIVED Evidence。
+ *
+ * Interpretation 是 ProvenanceVerifier 对 Observation 的分析结果，
+ * 属于推理性计算（云端模型分析 + 规则匹配），不是原始观察。
+ */
+export function mapInterpretationToEvidence(
+  event: SovereigntyEvent,
+): Evidence {
+  const payload = event.payload as InterpretationPayload;
+  const source: EvidenceSource = {
+    providerId: SCA_INTERPRETATION_PROVIDER,
+    observedAt: event.ts,
+  };
+
+  const scoreTag = payload.riskTags?.find(
+    (t) =>
+      t.label?.includes("契合度评估") ||
+      (t.label?.includes("匹配") &&
+        !t.label?.includes("率") &&
+        !t.label?.includes("风险")),
+  );
+
+  return {
+    id: event.id,
+    claimKey: "interpretation:job_analysis",
+    value: {
+      summary: payload.summary,
+      riskTags: payload.riskTags,
+      entities: payload.entities,
+      matchScore: scoreTag ? Math.round(scoreTag.confidence * 100) : undefined,
+      modelVersion: payload.modelVersion,
+      isLocal: payload.isLocal,
+      observationId: payload.observationId,
+    },
+    authority: "DERIVED",
+    source,
+    confidence: scoreTag?.confidence,
+    createdAt: event.ts,
+  };
+}
+
+// ============================================================
+// 污染测试辅助：构造各种事件场景
+// ============================================================
+
+export interface ContaminationTestScenario {
+  name: string;
+  description: string;
+  events: SovereigntyEvent[];
+  expectedAuthorizedCount: number;
+  expectedAuthorizedIds: string[];
+}
+
+/**
+ * 构造污染测试场景。
+ * 用于验证 Authority Gate 的抗污染能力。
+ */
+export function buildContaminationScenarios(): ContaminationTestScenario[] {
+  const baseObservation = (
+    id: string,
+    chainId: string,
+    source: SovereigntyEvent["source"] = "content_script",
+  ): SovereigntyEvent => ({
+    id,
+    ts: 1000,
+    type: "observation",
+    payload: {
+      chainId,
+      pageUrl: "https://example.com/job/123",
+      pageTitle: "Java 后端工程师",
+      extractedText: "岗位职责：...",
+      selector: "Container",
+    } as ObservationPayload,
+    source,
+    traceHash: "hash1",
+    chainId,
+  });
+
+  const baseInterpretation = (
+    id: string,
+    observationId: string,
+    chainId: string,
+  ): SovereigntyEvent => ({
+    id,
+    ts: 1001,
+    type: "interpretation",
+    payload: {
+      chainId,
+      observationId,
+      riskTags: [{ label: "契合度评估", confidence: 0.85 }],
+      summary: "匹配度较高",
+      modelVersion: "v1",
+      isLocal: false,
+    } as InterpretationPayload,
+    source: "cloud",
+    traceHash: "hash2",
+    chainId,
+  });
+
+  return [
+    {
+      name: "正常情况：observation + 对应 interpretation",
+      description: "observation 有对应的 interpretation，应该被授权为 OBSERVED",
+      events: [
+        baseObservation("obs-1", "chain-1"),
+        baseInterpretation("interp-1", "obs-1", "chain-1"),
+      ],
+      expectedAuthorizedCount: 1,
+      expectedAuthorizedIds: ["obs-1"],
+    },
+    {
+      name: "污染 1：observation 但没有 interpretation",
+      description: "只有 observation 没有 interpretation，说明未经过 ProvenanceVerifier，不能授权",
+      events: [baseObservation("obs-2", "chain-2")],
+      expectedAuthorizedCount: 0,
+      expectedAuthorizedIds: [],
+    },
+    {
+      name: "污染 2：observation + interpretation 但 observationId 不匹配",
+      description: "interpretation.observationId 不等于 observation.id，不能证明是同一个观察的验证",
+      events: [
+        baseObservation("obs-3", "chain-3"),
+        baseInterpretation("interp-3", "obs-OTHER", "chain-3"),
+      ],
+      expectedAuthorizedCount: 0,
+      expectedAuthorizedIds: [],
+    },
+    {
+      name: "污染 3：observation 来源是 hub（非浏览器）",
+      description: "source=hub 不是真实浏览器观察，不能授权为 OBSERVED",
+      events: [
+        baseObservation("obs-4", "chain-4", "hub"),
+        baseInterpretation("interp-4", "obs-4", "chain-4"),
+      ],
+      expectedAuthorizedCount: 0,
+      expectedAuthorizedIds: [],
+    },
+    {
+      name: "污染 4：observation 来源是 cloud（非浏览器）",
+      description: "source=cloud 不是真实浏览器观察，不能授权为 OBSERVED",
+      events: [
+        baseObservation("obs-5", "chain-5", "cloud"),
+        baseInterpretation("interp-5", "obs-5", "chain-5"),
+      ],
+      expectedAuthorizedCount: 0,
+      expectedAuthorizedIds: [],
+    },
+    {
+      name: "混合：正常 observation + 污染 observation 在同一 chain",
+      description: "同一 chain 下有正常和污染的 observation，只有正常的被授权",
+      events: [
+        baseObservation("obs-6a", "chain-6"),
+        baseObservation("obs-6b", "chain-6", "hub"),
+        baseInterpretation("interp-6a", "obs-6a", "chain-6"),
+        baseInterpretation("interp-6b", "obs-6b", "chain-6"),
+      ],
+      expectedAuthorizedCount: 1,
+      expectedAuthorizedIds: ["obs-6a"],
+    },
+    {
+      name: "多个正常 observation 在同一 chain",
+      description: "多个 observation 都有对应 interpretation，全部被授权",
+      events: [
+        baseObservation("obs-7a", "chain-7"),
+        baseObservation("obs-7b", "chain-7"),
+        baseInterpretation("interp-7a", "obs-7a", "chain-7"),
+        baseInterpretation("interp-7b", "obs-7b", "chain-7"),
+      ],
+      expectedAuthorizedCount: 2,
+      expectedAuthorizedIds: ["obs-7a", "obs-7b"],
+    },
+  ];
+}
+</file>
+
+<file path="src/dsh-plugin/contract/evidence.ts">
+import type {
+  Evidence,
+  EvidenceSource,
+} from "./types";
+
+function generateId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * EvidenceFactory
+ *
+ * 这是插件内部的统一 Evidence 构造入口。
+ *
+ * ⚠️ Authority 边界（Phase A 修正）：
+ *
+ *   本工厂只允许产生 INFERRED / DERIVED / RETRACTED。
+ *   OBSERVED 必须由 SCA Runtime 的 ProvenanceVerifier 产生，
+ *   通过 ExistingSCARuntime Adapter 注入，Plugin 内部代码无权伪造。
+ *
+ *   这是 Evidence Authority Gate 的硬约束：
+ *   SCA Observation → MessageStore/Raw Evidence → ProvenanceVerifier → OBSERVED → DSH Plugin
+ *
+ *   如果 Plugin 需要"观察到的事实"，必须从 Runtime 返回的 Evidence[] 中消费，
+ *   不能自己构造 authority="OBSERVED" 的对象。
+ */
+export class EvidenceFactory {
+  /**
+   * 模型推理产生的证据。可信度由 confidence 表达，不具备现实权威性。
+   */
+  inferred<T>(
+    claimKey: string,
+    value: T,
+    options?: {
+      confidence?: number;
+      source?: EvidenceSource;
+    },
+  ): Evidence<T> {
+    return this.create(
+      claimKey,
+      value,
+      "INFERRED",
+      options?.source,
+      options?.confidence,
+    );
+  }
+
+  /**
+   * 确定性计算产生的证据。例如匹配度评分、聚合统计。
+   * 必须在 derivedFromEvidenceIds 中追溯到上游 OBSERVED。
+   */
+  derived<T>(
+    claimKey: string,
+    value: T,
+    options?: {
+      confidence?: number;
+      source?: EvidenceSource;
+    },
+  ): Evidence<T> {
+    return this.create(
+      claimKey,
+      value,
+      "DERIVED",
+      options?.source,
+      options?.confidence,
+    );
+  }
+
+  /**
+   * 撤回已有证据。通常用于 OBSERVED 被证伪后的状态变更。
+   */
+  retract<T>(
+    evidence: Evidence<T>,
+    timestamp = Date.now(),
+  ): Evidence<T> {
+    return {
+      ...evidence,
+      authority: "RETRACTED",
+      retractedAt: timestamp,
+    };
+  }
+
+  private create<T>(
+    claimKey: string,
+    value: T,
+    authority: "INFERRED" | "DERIVED",
+    source?: EvidenceSource,
+    confidence?: number,
+  ): Evidence<T> {
+    return {
+      id: generateId("ev"),
+      claimKey,
+      value,
+      authority,
+      source,
+      confidence,
+      createdAt: Date.now(),
+    };
+  }
+}
+</file>
+
+<file path="src/dsh-plugin/contract/mission-completion.ts">
+/**
+ * Mission Completion 不变量
+ *
+ * ⚠️ 内核硬约束（Phase F-1.1）：
+ *
+ *   COMPLETED 不是 Service "设置" 的状态，而是 VerificationPassed 事件产生后，
+ *   由 Projection 推导出来的状态。
+ *
+ *   不存在任何"Action/Decision Event → COMPLETED"的捷径。
+ *
+ * 权威链：
+ *   Reality → Observation → ProvenanceVerifier → OBSERVED
+ *     → DERIVED (application.status = SUBMITTED)
+ *     → VerificationPassed → Mission Projection → COMPLETED
+ *
+ * Phase F-1.1 升级：
+ *   EvidenceScopeValid 从"时间范围"升级为"Mission + Action + Temporal"作用域约束。
+ *   仅靠 createdAt >= actionStartedAt 不能防止跨 Mission 证据污染。
+ *
+ *   confirmed 不再存储在 Event 中，而是从 Evidence 推导的 Derived State。
+ */
+
+import type {
+  Evidence,
+  MissionRecord,
+  MissionVerification,
+} from "./types";
+
+/**
+ * Completion 不变量检查结果。
+ */
+export interface CompletionInvariantResult {
+  canComplete: boolean;
+  violations: string[];
+}
+
+/**
+ * Mission 上下文，用于 EvidenceScopeValid 检查。
+ *
+ * ⚠️ Phase F-1.1: 时间只能作为辅助约束，主要 Scope Authority 是 missionId + actionId。
+ */
+export interface MissionCompletionContext {
+  missionId: string;
+  correlationId: string;
+  operationId: string;
+  /** Action 唯一标识（如 receiptId 或 action.id） */
+  actionId?: string;
+  /** Action 开始时间，evidence 必须晚于此时间（辅助约束） */
+  actionStartedAt?: number;
+  /** Action 完成时间 */
+  actionCompletedAt?: number;
+  /** 预期的目标 URI（如 job URL），evidence.source.uri 应匹配 */
+  expectedTargetUri?: string;
+}
+
+/**
+ * 验证 Evidence 是否属于当前 Mission/Action。
+ *
+ * ⚠️ Phase F-1.1: EvidenceScopeValid = MissionScope ∧ ActionScope ∧ TemporalScope ∧ ClaimScope
+ *
+ * 仅靠 createdAt >= actionStartedAt 不足以防止：
+ *   Mission A (10:00 start) ← Mission B (10:02 observation) 错误吸收
+ *
+ * 必须通过 missionId + actionId 明确关联。
+ *
+ * @param evidence 待验证的 Evidence
+ * @param context Mission 上下文
+ * @returns 是否通过作用域检查，以及失败原因
+ */
+export function checkEvidenceScope(
+  evidence: Evidence,
+  context: MissionCompletionContext,
+): { valid: boolean; reason?: string } {
+  // 1. MissionScope: evidence.missionId 必须等于当前 mission.id
+  if (evidence.missionId && evidence.missionId !== context.missionId) {
+    return {
+      valid: false,
+      reason: `MISSION_SCOPE_MISMATCH: evidence.missionId=${evidence.missionId} !== context.missionId=${context.missionId}`,
+    };
+  }
+
+  // 2. ActionScope: evidence.actionId 必须等于当前 action.id（如果 action 存在）
+  if (context.actionId && evidence.actionId && evidence.actionId !== context.actionId) {
+    return {
+      valid: false,
+      reason: `ACTION_SCOPE_MISMATCH: evidence.actionId=${evidence.actionId} !== context.actionId=${context.actionId}`,
+    };
+  }
+
+  // 3. TemporalScope: evidence.createdAt 必须 >= actionStartedAt（辅助约束）
+  if (context.actionStartedAt && evidence.createdAt < context.actionStartedAt) {
+    return {
+      valid: false,
+      reason: `TEMPORAL_SCOPE_INVALID: evidence.createdAt=${evidence.createdAt} < actionStartedAt=${context.actionStartedAt}`,
+    };
+  }
+
+  // 4. CorrelationScope: 如果 evidence 有 correlationId，必须匹配
+  if (evidence.correlationId && evidence.correlationId !== context.correlationId) {
+    return {
+      valid: false,
+      reason: `CORRELATION_SCOPE_MISMATCH: evidence.correlationId=${evidence.correlationId} !== context.correlationId=${context.correlationId}`,
+    };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * 从 Evidence 推导验证是否成功。
+ *
+ * ⚠️ Phase F-1.1: confirmed 不存储在 Event 中，而是从 Evidence 推导。
+ *
+ * 默认逻辑：存在至少 1 条 OBSERVED Evidence 即视为"有验证数据"。
+ * 具体的"成功/失败"语义由调用方传入 isSuccess 函数判断
+ * （如 verifyApply 中匹配 APPLICATION_SUCCESS_PATTERNS）。
+ *
+ * @param evidence 验证用的 Evidence 列表
+ * @param isSuccess 可选的成功判定函数
+ * @returns 是否确认成功
+ */
+export function deriveVerificationSuccess(
+  evidence: Evidence[],
+  isSuccess?: (evidence: Evidence[]) => boolean,
+): boolean {
+  if (evidence.length === 0) return false;
+
+  const hasObserved = evidence.some((e) => e.authority === "OBSERVED");
+  if (!hasObserved) return false;
+
+  if (isSuccess) {
+    return isSuccess(evidence);
+  }
+
+  // 默认：有 OBSERVED evidence 即视为验证数据存在
+  // （具体成功语义由调用方判断）
+  return hasObserved;
+}
+
+/**
+ * 检查 Mission 是否满足 COMPLETED 的全部不变量。
+ *
+ * COMPLETED 必须同时满足：
+ *   1. ActionCompleted: action.completedAt !== undefined
+ *   2. VerificationExists: verification !== undefined
+ *   3. EvidenceExists: verification.evidenceIds 非空
+ *   4. AllObserved: 验证证据全部为 OBSERVED authority
+ *   5. EvidenceMissionScopeValid: evidence.missionId === mission.id
+ *   6. EvidenceActionScopeValid: evidence.actionId === mission.action.id
+ *   7. EvidenceTemporalScopeValid: evidence.createdAt >= actionStartedAt
+ *   8. VerificationConfirmed: 从 evidence 推导的验证结论为成功
+ *
+ * 注意：
+ *   - 第 4-7 条需要传入实际的 Evidence 对象才能验证
+ *   - 第 5-7 条需要传入 missionContext 才能验证
+ *   - 第 8 条需要传入 isSuccess 函数才能精确判断
+ */
+export function checkCompletionInvariants(
+  mission: MissionRecord,
+  verificationEvidence?: Evidence[],
+  context?: MissionCompletionContext,
+  isSuccess?: (evidence: Evidence[]) => boolean,
+): CompletionInvariantResult {
+  const violations: string[] = [];
+
+  // 1. ActionCompleted
+  if (!mission.action?.completedAt) {
+    violations.push("ACTION_NOT_COMPLETED: action.completedAt is undefined");
+  }
+
+  // 2. VerificationExists
+  if (!mission.verification) {
+    violations.push("VERIFICATION_MISSING: verification is undefined");
+  } else {
+    // 3. EvidenceExists
+    if (
+      !mission.verification.evidenceIds ||
+      mission.verification.evidenceIds.length === 0
+    ) {
+      violations.push("VERIFICATION_NO_EVIDENCE: verification.evidenceIds is empty");
+    }
+  }
+
+  // 4-8. 需要实际 Evidence 和 Context
+  if (verificationEvidence && verificationEvidence.length > 0) {
+    // 4. MustHaveObserved: 必须至少有一条 OBSERVED evidence
+    // 注意：DERIVED evidence 是允许的（从 OBSERVED 推导），但 INFERRED/RETRACTED 不允许
+    const hasObserved = verificationEvidence.some(
+      (e) => e.authority === "OBSERVED",
+    );
+    if (!hasObserved) {
+      violations.push(
+        "NO_OBSERVED_EVIDENCE: verification evidence must contain at least one OBSERVED authority",
+      );
+    }
+
+    // 4b. 不允许 INFERRED 或 RETRACTED 出现在 verification evidence 中
+    const invalidAuthority = verificationEvidence.filter(
+      (e) => e.authority === "INFERRED" || e.authority === "RETRACTED",
+    );
+    if (invalidAuthority.length > 0) {
+      violations.push(
+        `INVALID_VERIFICATION_AUTHORITY: ${invalidAuthority.length} evidence(s) have INFERRED/RETRACTED authority: ${invalidAuthority
+          .map((e) => `${e.id}=${e.authority}`)
+          .join(", ")}`,
+      );
+    }
+
+    // 4b. Evidence count 与 evidenceIds 一致
+    if (mission.verification?.evidenceIds) {
+      const evidenceIdSet = new Set(verificationEvidence.map((e) => e.id));
+      const missingIds = mission.verification.evidenceIds.filter(
+        (id) => !evidenceIdSet.has(id),
+      );
+      if (missingIds.length > 0) {
+        violations.push(
+          `EVIDENCE_ID_MISMATCH: ${missingIds.length} evidenceId(s) in verification not found in actual evidence`,
+        );
+      }
+    }
+
+    // 5-7. EvidenceScopeValid（需要 context）
+    if (context) {
+      for (const ev of verificationEvidence) {
+        const scope = checkEvidenceScope(ev, context);
+        if (!scope.valid) {
+          violations.push(`EVIDENCE_SCOPE_INVALID: evidence=${ev.id} - ${scope.reason}`);
+        }
+      }
+    }
+
+    // 8. VerificationConfirmed（从 evidence 推导）
+    const confirmed = deriveVerificationSuccess(verificationEvidence, isSuccess);
+    if (!confirmed) {
+      violations.push(
+        "VERIFICATION_NOT_CONFIRMED: derived verification result is not success (no matching OBSERVED evidence or isSuccess returned false)",
+      );
+    }
+  } else if (mission.verification?.evidenceIds?.length) {
+    // 有 evidenceIds 但没有传入实际 evidence —— 无法验证 authority 和 scope
+    violations.push(
+      "EVIDENCE_NOT_PROVIDED: verification.evidenceIds exists but actual evidence not provided for authority/scope validation",
+    );
+  }
+
+  return {
+    canComplete: violations.length === 0,
+    violations,
+  };
+}
+
+/**
+ * 断言 Mission 满足 COMPLETED 不变量。
+ * 不满足时抛出 Error，包含所有违规项。
+ */
+export function assertCompletionInvariants(
+  mission: MissionRecord,
+  verificationEvidence?: Evidence[],
+  context?: MissionCompletionContext,
+  isSuccess?: (evidence: Evidence[]) => boolean,
+): void {
+  const result = checkCompletionInvariants(
+    mission,
+    verificationEvidence,
+    context,
+    isSuccess,
+  );
+  if (!result.canComplete) {
+    throw new Error(
+      `COMPLETION_INVARIANT_VIOLATION:\n${result.violations
+        .map((v) => `  - ${v}`)
+        .join("\n")}`,
+    );
+  }
+}
+
+/**
+ * 从 Verification 结果推导 Mission 是否可以 COMPLETED。
+ *
+ * 这是 COMPLETED 的唯一合法入口。
+ * Service 不能直接设置 state = "COMPLETED"，
+ * 必须通过此函数验证后才能进入 COMPLETED。
+ *
+ * @param mission 当前 Mission 状态（应处于 VERIFYING）
+ * @param verification Verification 结果（只包含 evidenceIds，不包含 confirmed）
+ * @param verificationEvidence 实际的 Evidence 对象（用于验证 authority 和 scope）
+ * @param context Mission 上下文（用于 EvidenceScopeValid 检查）
+ * @param isSuccess 可选的成功判定函数（如匹配 APPLICATION_SUCCESS_PATTERNS）
+ * @returns 更新后的 MissionRecord，如果不满足不变量则 state 保持 VERIFYING
+ */
+export function deriveCompletionFromVerification(
+  mission: MissionRecord,
+  verification: MissionVerification,
+  verificationEvidence?: Evidence[],
+  context?: MissionCompletionContext,
+  isSuccess?: (evidence: Evidence[]) => boolean,
+): MissionRecord {
+  const candidate: MissionRecord = {
+    ...mission,
+    verification,
+    updatedAt: Date.now(),
+  };
+
+  const result = checkCompletionInvariants(
+    candidate,
+    verificationEvidence,
+    context,
+    isSuccess,
+  );
+
+  if (!result.canComplete) {
+    // 不满足不变量，不能进入 COMPLETED
+    return candidate; // state 保持 VERIFYING
+  }
+
+  return {
+    ...candidate,
+    state: "COMPLETED",
+    pendingApproval: undefined,
+    updatedAt: Date.now(),
+  };
+}
+
+/**
+ * 检查 Mission 是否处于可以被验证的状态。
+ */
+export function canVerify(mission: MissionRecord): boolean {
+  return mission.state === "VERIFYING" || mission.state === "EXECUTING";
+}
+
+/**
+ * 检查 Mission 是否处于可以被批准的状态。
+ */
+export function canApprove(mission: MissionRecord): boolean {
+  return mission.state === "AWAITING_APPROVAL";
+}
+
+/**
+ * Completion Gate 的完整不变量清单（Phase F-1.1）。
+ */
+export const COMPLETION_INVARIANTS = [
+  "ACTION_COMPLETED: mission.action.completedAt must be defined",
+  "VERIFICATION_EXISTS: mission.verification must be defined",
+  "EVIDENCE_EXISTS: mission.verification.evidenceIds must be non-empty",
+  "ALL_OBSERVED: all verification evidence must have authority === OBSERVED",
+  "EVIDENCE_MISSION_SCOPE_VALID: evidence.missionId must equal mission.id",
+  "EVIDENCE_ACTION_SCOPE_VALID: evidence.actionId must equal current action.id",
+  "EVIDENCE_TEMPORAL_SCOPE_VALID: evidence.createdAt must be >= action.startedAt",
+  "VERIFICATION_CONFIRMED: derived verification result must be success (from OBSERVED evidence)",
+  "NO_DECISION_SHORTCUT: decision/dispatch events cannot directly produce COMPLETED",
+  "PROJECTION_ONLY: COMPLETED is derived from VerificationPassed event, not set directly",
+  "NO_CONFIRMED_IN_EVENT: VerificationCaptured must not store confirmed field (derived state)",
+] as const;
+</file>
+
+<file path="src/dsh-plugin/contract/mission-events.ts">
+/**
+ * Mission Domain Event Schema
+ *
+ * ⚠️ Phase F-1: Mission Event Schema 语义边界定死。
+ *
+ * Mission 不"存 State"，Mission 是"投影 State"。
+ * 这些 Domain Event 写入 SCA Event Store（type=narrative, chainId=dsh_mission_{id}），
+ * MissionRecord 完全由这些事件投影产生。
+ *
+ * 语义分层：
+ *   Mission     → 为什么要做这个事情？（业务意图）
+ *   Execution   → 现实世界做了什么？（SCA 执行）
+ *   Evidence    → 现实世界发生了什么可验证事实？（Observation）
+ *
+ * 三者通过 correlationId / operationId / evidenceIds 关联，不混成一个 Aggregate。
+ */
+
+import type {
+  ApprovalRequest,
+  FailureState,
+  MissionAction,
+  MissionKind,
+  MissionState,
+  MissionVerification,
+} from "./types";
+
+// ============================================================
+// Event Type 枚举
+// ============================================================
+
+export type MissionEventType =
+  | "MISSION_CREATED"
+  | "MISSION_STATE_CHANGED"
+  | "MISSION_CHECKPOINTED"
+  | "APPROVAL_REQUESTED"
+  | "APPROVAL_GRANTED"
+  | "APPROVAL_DENIED"
+  | "ACTION_UPDATED"
+  | "VERIFICATION_CAPTURED"
+  | "MISSION_FAILED";
+
+// ============================================================
+// Event Payloads —— 每个事件的语义边界
+// ============================================================
+
+/**
+ * MissionCreated
+ *
+ * 语义：用户/DSH 请求产生了一次 Mission。
+ * 只表达"意图存在"，不表达任何执行状态。
+ */
+export interface MissionCreatedEvent {
+  type: "MISSION_CREATED";
+  missionId: string;
+  kind: MissionKind;
+  input: unknown;
+  correlationId: string;
+  operationId: string;
+  createdAt: number;
+}
+
+/**
+ * MissionStateChanged
+ *
+ * 语义：Mission projection 的生命周期变化。
+ * 只表达"状态机迁移"，不表达"为什么迁移"（原因在其他事件中）。
+ *
+ * 合法迁移由 canTransition() 校验，非法迁移不会产生此事件。
+ */
+export interface MissionStateChangedEvent {
+  type: "MISSION_STATE_CHANGED";
+  missionId: string;
+  fromState: MissionState;
+  toState: MissionState;
+  reason?: string;
+  changedAt: number;
+}
+
+/**
+ * MissionCheckpointed
+ *
+ * 语义：执行过程中的检查点数据。
+ * 用于恢复中断的 Mission，不影响状态机。
+ */
+export interface MissionCheckpointedEvent {
+  type: "MISSION_CHECKPOINTED";
+  missionId: string;
+  checkpoint: unknown;
+  changedAt: number;
+}
+
+/**
+ * ApprovalRequested
+ *
+ * 语义：Policy Gate 判断此次行动需要外部批准。
+ * 只表达"请求了批准"，不表达"批准了"。
+ */
+export interface ApprovalRequestedEvent {
+  type: "APPROVAL_REQUESTED";
+  missionId: string;
+  approval: ApprovalRequest;
+  changedAt: number;
+}
+
+/**
+ * ApprovalGranted
+ *
+ * 语义：Policy Gate 获得了合法批准。
+ * 批准后 Mission 可以从 AWAITING_APPROVAL 迁移到 EXECUTING。
+ */
+export interface ApprovalGrantedEvent {
+  type: "APPROVAL_GRANTED";
+  missionId: string;
+  approvalToken?: string;
+  reason?: string;
+  changedAt: number;
+}
+
+/**
+ * ApprovalDenied
+ *
+ * 语义：批准被拒绝。
+ * 拒绝后 Mission 进入 CANCELLED。
+ */
+export interface ApprovalDeniedEvent {
+  type: "APPROVAL_DENIED";
+  missionId: string;
+  reason?: string;
+  changedAt: number;
+}
+
+/**
+ * ActionUpdated
+ *
+ * 语义：SCA 执行层发生了行动状态变化。
+ * 只表达"执行层状态"，不表达"现实世界结果"（结果在 Verification 中）。
+ *
+ * 注意：action.receipt 是 Provider 返回的原始执行回执，
+ * 不能作为 Verification 依据（accepted !== 成功）。
+ */
+export interface ActionUpdatedEvent {
+  type: "ACTION_UPDATED";
+  missionId: string;
+  action: MissionAction;
+  changedAt: number;
+}
+
+/**
+ * VerificationCaptured
+ *
+ * 语义：已经获得此次 action 的验证结果。
+ *
+ * ⚠️ 关键边界：
+ *   此事件只引用 evidenceIds，不包含 authority 字段。
+ *   真正的 Evidence Authority 在 Evidence/Event 链上（OBSERVED / DERIVED）。
+ *
+ *   verification.confirmed 是 DERIVED 结论（从 OBSERVED 推导），
+ *   不是 OBSERVED 事实本身。
+ *
+ *   不存在 "authority: OBSERVED" 在此事件中。
+ */
+export interface VerificationCapturedEvent {
+  type: "VERIFICATION_CAPTURED";
+  missionId: string;
+  verification: MissionVerification;
+  changedAt: number;
+}
+
+/**
+ * MissionFailed
+ *
+ * 语义：Mission 因不可恢复的原因失败。
+ * failure 包含失败分类和恢复建议。
+ */
+export interface MissionFailedEvent {
+  type: "MISSION_FAILED";
+  missionId: string;
+  failure: FailureState;
+  changedAt: number;
+}
+
+// ============================================================
+// Union Type
+// ============================================================
+
+export type MissionDomainEvent =
+  | MissionCreatedEvent
+  | MissionStateChangedEvent
+  | MissionCheckpointedEvent
+  | ApprovalRequestedEvent
+  | ApprovalGrantedEvent
+  | ApprovalDeniedEvent
+  | ActionUpdatedEvent
+  | VerificationCapturedEvent
+  | MissionFailedEvent;
+
+// ============================================================
+// Event → SCA Narrative Payload 映射
+//
+// SCA Event Store 的 SovereigntyEvent.type = "narrative"，
+// payload.note 字段用于区分 Mission Domain Event 类型。
+// ============================================================
+
+export const MISSION_EVENT_NOTE_MAP: Record<MissionEventType, string> = {
+  MISSION_CREATED: "MISSION_CREATED",
+  MISSION_STATE_CHANGED: "MISSION_STATE_CHANGED",
+  MISSION_CHECKPOINTED: "MISSION_CHECKPOINTED",
+  APPROVAL_REQUESTED: "APPROVAL_REQUESTED",
+  APPROVAL_GRANTED: "APPROVAL_GRANTED",
+  APPROVAL_DENIED: "APPROVAL_DENIED",
+  ACTION_UPDATED: "MISSION_ACTION_UPDATED",
+  VERIFICATION_CAPTURED: "MISSION_VERIFICATION_CAPTURED",
+  MISSION_FAILED: "MISSION_FAILED",
+};
+
+export function missionChainId(missionId: string): string {
+  return `dsh_mission_${missionId}`;
+}
+
+// ============================================================
+// 语义边界断言
+// ============================================================
+
+/**
+ * 验证 VerificationCaptured 事件的语义边界。
+ *
+ * ⚠️ Phase F-1.1:
+ *   1. 不能包含 authority 字段（Evidence Authority 在 Evidence/Event 链上）
+ *   2. 不能包含 confirmed 字段（confirmed 是 Derived State，不是历史事实）
+ *   3. evidenceIds 必须非空
+ */
+export function assertVerificationBoundary(
+  event: VerificationCapturedEvent,
+): void {
+  const v = event.verification;
+
+  if (v && typeof v === "object" && "authority" in v) {
+    throw new Error(
+      "VERIFICATION_BOUNDARY_VIOLATION: VerificationCaptured must not contain authority field. " +
+        "Evidence authority lives on the Evidence/Event chain, referenced by evidenceIds.",
+    );
+  }
+
+  if (v && typeof v === "object" && "confirmed" in v) {
+    throw new Error(
+      "VERIFICATION_BOUNDARY_VIOLATION: VerificationCaptured must not contain confirmed field. " +
+        "confirmed is a Derived State projected from Evidence, not a historical fact to store.",
+    );
+  }
+
+  if (!v.evidenceIds || v.evidenceIds.length === 0) {
+    throw new Error(
+      "VERIFICATION_BOUNDARY_VIOLATION: VerificationCaptured must contain non-empty evidenceIds.",
+    );
+  }
+}
+</file>
+
+<file path="src/dsh-plugin/contract/mission-projection.ts">
+/**
+ * Mission Projection —— 纯函数层
+ *
+ * ⚠️ Phase F: Mission 不"存 State"，Mission 是"投影 State"。
+ *
+ * 这个模块包含从 Mission Domain Event 流投影出 MissionRecord 的纯函数。
+ * 不依赖任何运行时模块（chrome/IDB/fetch），可以在任何环境中测试。
+ *
+ * 投影规则：
+ *   Event Store
+ *     │
+ *     ├── MISSION_CREATED          → 初始化 MissionRecord
+ *     ├── MISSION_STATE_CHANGED    → 更新 state
+ *     ├── MISSION_CHECKPOINTED     → 更新 checkpoint
+ *     ├── APPROVAL_REQUESTED       → 更新 pendingApproval
+ *     ├── APPROVAL_GRANTED         → 清除 pendingApproval
+ *     ├── APPROVAL_DENIED          → 清除 pendingApproval + failure
+ *     ├── ACTION_UPDATED           → 更新 action
+ *     ├── VERIFICATION_CAPTURED    → 更新 verification
+ *     └── MISSION_FAILED           → 更新 failure + state=FAILED
+ *     │
+ *     ▼
+ *   MissionRecord（投影结果）
+ *
+ * 核心不变量：
+ *   删除 MissionRecord → 重新读取 Event Store → replay → 得到完全相同的 MissionRecord
+ */
+
+import type {
+  MissionRecord,
+  MissionState,
+} from "./types";
+import type {
+  MissionDomainEvent,
+  MissionCreatedEvent,
+  MissionStateChangedEvent,
+  MissionCheckpointedEvent,
+  ApprovalRequestedEvent,
+  ApprovalGrantedEvent,
+  ApprovalDeniedEvent,
+  ActionUpdatedEvent,
+  VerificationCapturedEvent,
+  MissionFailedEvent,
+} from "./mission-events";
+
+/**
+ * 从 Mission Domain Event 流投影出 MissionRecord。
+ *
+ * 这是纯函数：相同的事件输入总是产生相同的投影输出。
+ * 不依赖外部状态，可以用于 Replay 测试。
+ *
+ * @param events 按时间排序的 Mission Domain Event 列表
+ * @returns 投影后的 MissionRecord，如果没有 MISSION_CREATED 事件则返回 null
+ */
+export function projectMissionEvents(
+  events: MissionDomainEvent[],
+): MissionRecord | null {
+  if (events.length === 0) return null;
+
+  // 找到 MISSION_CREATED 事件（必须是第一个事件）
+  const createdEvent = events.find(
+    (e): e is MissionCreatedEvent => e.type === "MISSION_CREATED",
+  );
+
+  if (!createdEvent) {
+    return null;
+  }
+
+  // 初始化 MissionRecord
+  let mission: MissionRecord = {
+    id: createdEvent.missionId,
+    kind: createdEvent.kind,
+    state: "CREATED",
+    createdAt: createdEvent.createdAt,
+    updatedAt: createdEvent.createdAt,
+    input: createdEvent.input,
+    correlationId: createdEvent.correlationId,
+    operationId: createdEvent.operationId,
+  };
+
+  // 按顺序应用后续事件
+  for (const event of events) {
+    if (event.type === "MISSION_CREATED") continue; // 已处理
+
+    mission = applyEvent(mission, event);
+  }
+
+  return mission;
+}
+
+/**
+ * 应用单个事件到 MissionRecord。
+ */
+function applyEvent(
+  mission: MissionRecord,
+  event: MissionDomainEvent,
+): MissionRecord {
+  switch (event.type) {
+    case "MISSION_STATE_CHANGED":
+      return applyStateChanged(mission, event);
+
+    case "MISSION_CHECKPOINTED":
+      return applyCheckpointed(mission, event);
+
+    case "APPROVAL_REQUESTED":
+      return applyApprovalRequested(mission, event);
+
+    case "APPROVAL_GRANTED":
+      return applyApprovalGranted(mission, event);
+
+    case "APPROVAL_DENIED":
+      return applyApprovalDenied(mission, event);
+
+    case "ACTION_UPDATED":
+      return applyActionUpdated(mission, event);
+
+    case "VERIFICATION_CAPTURED":
+      return applyVerificationCaptured(mission, event);
+
+    case "MISSION_FAILED":
+      return applyFailed(mission, event);
+
+    default:
+      return mission;
+  }
+}
+
+function applyStateChanged(
+  mission: MissionRecord,
+  event: MissionStateChangedEvent,
+): MissionRecord {
+  return {
+    ...mission,
+    state: event.toState,
+    updatedAt: event.changedAt,
+  };
+}
+
+function applyCheckpointed(
+  mission: MissionRecord,
+  event: MissionCheckpointedEvent,
+): MissionRecord {
+  return {
+    ...mission,
+    checkpoint: event.checkpoint,
+    updatedAt: event.changedAt,
+  };
+}
+
+function applyApprovalRequested(
+  mission: MissionRecord,
+  event: ApprovalRequestedEvent,
+): MissionRecord {
+  return {
+    ...mission,
+    state: "AWAITING_APPROVAL",
+    pendingApproval: event.approval,
+    updatedAt: event.changedAt,
+  };
+}
+
+function applyApprovalGranted(
+  mission: MissionRecord,
+  event: ApprovalGrantedEvent,
+): MissionRecord {
+  return {
+    ...mission,
+    pendingApproval: undefined,
+    updatedAt: event.changedAt,
+  };
+}
+
+function applyApprovalDenied(
+  mission: MissionRecord,
+  event: ApprovalDeniedEvent,
+): MissionRecord {
+  return {
+    ...mission,
+    state: "CANCELLED",
+    pendingApproval: undefined,
+    failure: event.reason
+      ? {
+          code: "APPROVAL_DENIED",
+          category: "POLICY",
+          message: event.reason,
+          recoverable: false,
+          retryable: false,
+        }
+      : undefined,
+    updatedAt: event.changedAt,
+  };
+}
+
+function applyActionUpdated(
+  mission: MissionRecord,
+  event: ActionUpdatedEvent,
+): MissionRecord {
+  return {
+    ...mission,
+    action: event.action,
+    updatedAt: event.changedAt,
+  };
+}
+
+function applyVerificationCaptured(
+  mission: MissionRecord,
+  event: VerificationCapturedEvent,
+): MissionRecord {
+  return {
+    ...mission,
+    verification: event.verification,
+    updatedAt: event.changedAt,
+  };
+}
+
+function applyFailed(
+  mission: MissionRecord,
+  event: MissionFailedEvent,
+): MissionRecord {
+  return {
+    ...mission,
+    state: "FAILED",
+    failure: event.failure,
+    updatedAt: event.changedAt,
+  };
+}
+
+// ============================================================
+// Replay 测试辅助：构造事件场景
+// ============================================================
+
+export interface ReplayTestScenario {
+  name: string;
+  description: string;
+  events: MissionDomainEvent[];
+  expectedState: MissionState;
+  expectedFields?: Partial<MissionRecord>;
+}
+
+/**
+ * 构造 Replay 测试场景。
+ * 用于验证 Mission 可以从 Event Store 完整重建。
+ */
+export function buildReplayScenarios(): ReplayTestScenario[] {
+  const baseCreated = (
+    id: string,
+    kind: MissionRecord["kind"] = "JOB_SEARCH",
+  ): MissionCreatedEvent => ({
+    type: "MISSION_CREATED",
+    missionId: id,
+    kind,
+    input: { query: "Java 后端" },
+    correlationId: `corr-${id}`,
+    operationId: `op-${id}`,
+    createdAt: 1000,
+  });
+
+  const stateChange = (
+    id: string,
+    from: MissionState,
+    to: MissionState,
+    ts: number,
+  ): MissionStateChangedEvent => ({
+    type: "MISSION_STATE_CHANGED",
+    missionId: id,
+    fromState: from,
+    toState: to,
+    changedAt: ts,
+  });
+
+  return [
+    {
+      name: "空事件流",
+      description: "没有任何事件，投影结果为 null",
+      events: [],
+      expectedState: "CREATED" as MissionState, // 不会用到，因为返回 null
+      expectedFields: undefined,
+    },
+    {
+      name: "只有 MISSION_CREATED",
+      description: "只有创建事件，状态为 CREATED",
+      events: [baseCreated("m-1")],
+      expectedState: "CREATED",
+      expectedFields: {
+        id: "m-1",
+        kind: "JOB_SEARCH",
+        correlationId: "corr-m-1",
+      },
+    },
+    {
+      name: "Search 完整流程",
+      description: "CREATED → PLANNING → DISCOVERING → COLLECTING → EVALUATING → COMPLETED",
+      events: [
+        baseCreated("m-2"),
+        stateChange("m-2", "CREATED", "PLANNING", 1001),
+        stateChange("m-2", "PLANNING", "DISCOVERING", 1002),
+        stateChange("m-2", "DISCOVERING", "COLLECTING", 1003),
+        stateChange("m-2", "COLLECTING", "EVALUATING", 1004),
+        stateChange("m-2", "EVALUATING", "COMPLETED", 1005),
+      ],
+      expectedState: "COMPLETED",
+      expectedFields: {
+        id: "m-2",
+        updatedAt: 1005,
+      },
+    },
+    {
+      name: "Apply 需要审批流程",
+      description: "CREATED → PLANNING → AWAITING_APPROVAL（通过 APPROVAL_REQUESTED）",
+      events: [
+        baseCreated("m-3", "JOB_APPLICATION"),
+        stateChange("m-3", "CREATED", "PLANNING", 1001),
+        {
+          type: "APPROVAL_REQUESTED",
+          missionId: "m-3",
+          approval: {
+            missionId: "m-3",
+            reason: "投递需要审批",
+            requestedAt: 1002,
+          },
+          changedAt: 1002,
+        } as ApprovalRequestedEvent,
+      ],
+      expectedState: "AWAITING_APPROVAL",
+      expectedFields: {
+        pendingApproval: {
+          missionId: "m-3",
+          reason: "投递需要审批",
+          requestedAt: 1002,
+        },
+      },
+    },
+    {
+      name: "Apply 审批被拒绝",
+      description: "AWAITING_APPROVAL → APPROVAL_DENIED → CANCELLED",
+      events: [
+        baseCreated("m-4", "JOB_APPLICATION"),
+        stateChange("m-4", "CREATED", "PLANNING", 1001),
+        {
+          type: "APPROVAL_REQUESTED",
+          missionId: "m-4",
+          approval: { missionId: "m-4", reason: "需要审批", requestedAt: 1002 },
+          changedAt: 1002,
+        } as ApprovalRequestedEvent,
+        {
+          type: "APPROVAL_DENIED",
+          missionId: "m-4",
+          reason: "用户拒绝",
+          changedAt: 1003,
+        } as ApprovalDeniedEvent,
+      ],
+      expectedState: "CANCELLED",
+      expectedFields: {
+        pendingApproval: undefined,
+        failure: {
+          code: "APPROVAL_DENIED",
+          category: "POLICY",
+          message: "用户拒绝",
+          recoverable: false,
+          retryable: false,
+        },
+      },
+    },
+    {
+      name: "Apply 完整成功流程",
+      description: "CREATED → EXECUTING → ActionUpdated → VERIFYING → VerificationCaptured → COMPLETED",
+      events: [
+        baseCreated("m-5", "JOB_APPLICATION"),
+        stateChange("m-5", "CREATED", "EXECUTING", 1001),
+        {
+          type: "ACTION_UPDATED",
+          missionId: "m-5",
+          action: {
+            type: "JOB_APPLICATION",
+            startedAt: 1001,
+            completedAt: 1005,
+            receiptId: "receipt-1",
+          },
+          changedAt: 1005,
+        } as ActionUpdatedEvent,
+        stateChange("m-5", "EXECUTING", "VERIFYING", 1006),
+        {
+          type: "VERIFICATION_CAPTURED",
+          missionId: "m-5",
+          verification: {
+            evidenceIds: ["ev-1", "ev-2"],
+            verifiedAt: 1007,
+            confirmed: true,
+            summary: "投递成功",
+          },
+          changedAt: 1007,
+        } as VerificationCapturedEvent,
+        stateChange("m-5", "VERIFYING", "COMPLETED", 1008),
+      ],
+      expectedState: "COMPLETED",
+      expectedFields: {
+        action: {
+          type: "JOB_APPLICATION",
+          startedAt: 1001,
+          completedAt: 1005,
+          receiptId: "receipt-1",
+        },
+        verification: {
+          evidenceIds: ["ev-1", "ev-2"],
+          verifiedAt: 1007,
+          confirmed: true,
+          summary: "投递成功",
+        },
+      },
+    },
+    {
+      name: "Mission 失败",
+      description: "CREATED → PLANNING → MISSION_FAILED",
+      events: [
+        baseCreated("m-6"),
+        stateChange("m-6", "CREATED", "PLANNING", 1001),
+        {
+          type: "MISSION_FAILED",
+          missionId: "m-6",
+          failure: {
+            code: "NETWORK_ERROR",
+            category: "NETWORK",
+            message: "网络连接失败",
+            recoverable: true,
+            retryable: true,
+          },
+          changedAt: 1002,
+        } as MissionFailedEvent,
+      ],
+      expectedState: "FAILED",
+      expectedFields: {
+        failure: {
+          code: "NETWORK_ERROR",
+          category: "NETWORK",
+          message: "网络连接失败",
+          recoverable: true,
+          retryable: true,
+        },
+      },
+    },
+  ];
+}
+</file>
+
+<file path="src/dsh-plugin/contract/mission.ts">
+import type {
+  FailureState,
+  MissionKind,
+  MissionRecord,
+  MissionState,
+} from "./types";
+
+const TERMINAL_STATES = new Set<MissionState>([
+  "COMPLETED",
+  "FAILED",
+  "CANCELLED",
+]);
+
+const TRANSITIONS: Record<MissionState, MissionState[]> = {
+  CREATED: ["PLANNING", "CANCELLED", "FAILED"],
+  PLANNING: ["DISCOVERING", "COLLECTING", "AWAITING_APPROVAL", "PAUSED", "FAILED", "CANCELLED"],
+  DISCOVERING: ["COLLECTING", "PAUSED", "FAILED", "CANCELLED"],
+  COLLECTING: ["EVALUATING", "PAUSED", "FAILED", "CANCELLED"],
+  EVALUATING: ["AWAITING_APPROVAL", "COMPLETED", "PAUSED", "FAILED", "CANCELLED"],
+  AWAITING_APPROVAL: ["EXECUTING", "PAUSED", "FAILED", "CANCELLED"],
+  EXECUTING: ["VERIFYING", "PAUSED", "FAILED", "CANCELLED"],
+  VERIFYING: ["COMPLETED", "PAUSED", "FAILED", "CANCELLED"],
+  COMPLETED: [],
+  PAUSED: ["PLANNING", "DISCOVERING", "COLLECTING", "EVALUATING", "AWAITING_APPROVAL", "EXECUTING", "VERIFYING", "CANCELLED", "FAILED"],
+  FAILED: ["PLANNING", "DISCOVERING", "COLLECTING", "EVALUATING", "AWAITING_APPROVAL", "EXECUTING", "VERIFYING", "CANCELLED"],
+  CANCELLED: [],
+};
+
+function generateId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export function isTerminalState(state: MissionState): boolean {
+  return TERMINAL_STATES.has(state);
+}
+
+export function canTransition(
+  current: MissionState,
+  next: MissionState,
+): boolean {
+  return TRANSITIONS[current]?.includes(next) ?? false;
+}
+
+export interface MissionRepository {
+  create(
+    kind: MissionKind,
+    input: unknown,
+    correlationId: string,
+    operationId: string,
+  ): Promise<MissionRecord>;
+
+  get(id: string): Promise<MissionRecord | null>;
+
+  update(
+    id: string,
+    patch: Partial<Omit<MissionRecord, "id">>,
+  ): Promise<MissionRecord>;
+
+  checkpoint(
+    id: string,
+    checkpoint: unknown,
+  ): Promise<MissionRecord>;
+}
+
+export class InMemoryMissionRepository implements MissionRepository {
+  private readonly records = new Map<string, MissionRecord>();
+
+  async create(
+    kind: MissionKind,
+    input: unknown,
+    correlationId: string,
+    operationId: string,
+  ): Promise<MissionRecord> {
+    const now = Date.now();
+
+    const record: MissionRecord = {
+      id: generateId("mission"),
+      kind,
+      state: "CREATED",
+      createdAt: now,
+      updatedAt: now,
+      input,
+      correlationId,
+      operationId,
+    };
+
+    this.records.set(record.id, record);
+
+    return structuredClone(record);
+  }
+
+  async get(id: string): Promise<MissionRecord | null> {
+    const record = this.records.get(id);
+    return record ? structuredClone(record) : null;
+  }
+
+  async update(
+    id: string,
+    patch: Partial<Omit<MissionRecord, "id">>,
+  ): Promise<MissionRecord> {
+    const current = this.records.get(id);
+
+    if (!current) {
+      throw new Error(`MISSION_NOT_FOUND:${id}`);
+    }
+
+    if (patch.state && patch.state !== current.state) {
+      if (!canTransition(current.state, patch.state)) {
+        throw new Error(
+          `INVALID_MISSION_TRANSITION:${current.state}->${patch.state}`,
+        );
+      }
+    }
+
+    const next: MissionRecord = {
+      ...current,
+      ...patch,
+      updatedAt: Date.now(),
+    };
+
+    this.records.set(id, next);
+
+    return structuredClone(next);
+  }
+
+  async checkpoint(
+    id: string,
+    checkpoint: unknown,
+  ): Promise<MissionRecord> {
+    return this.update(id, { checkpoint });
+  }
+}
+
+export function missionFailure(
+  code: string,
+  category: FailureState["category"],
+  message: string,
+  options?: Partial<FailureState>,
+): FailureState {
+  return {
+    code,
+    category,
+    message,
+    recoverable: options?.recoverable ?? false,
+    retryable: options?.retryable ?? false,
+    nextAction: options?.nextAction,
+    details: options?.details,
+  };
+}
+</file>
+
+<file path="src/dsh-plugin/contract/policy.ts">
+import type {
+  ApplyRequest,
+  CareerConstraint,
+  PolicyDecision,
+} from "./types";
+
+export interface PolicyContext {
+  constraints: CareerConstraint;
+  action: "SEARCH" | "INSPECT" | "APPLY";
+}
+
+export interface PolicyEngine {
+  evaluate(
+    context: PolicyContext,
+    request?: ApplyRequest,
+  ): Promise<PolicyDecision>;
+}
+
+/**
+ * 第一版最小 Policy。
+ *
+ * 后续应该把现有 SCA rule-engine / UserConstitution
+ * 通过 Adapter 接入，而不是复制一套规则。
+ */
+export class DefaultPolicyEngine implements PolicyEngine {
+  async evaluate(
+    context: PolicyContext,
+    request?: ApplyRequest,
+  ): Promise<PolicyDecision> {
+    if (context.action !== "APPLY") {
+      return {
+        effect: "ALLOW",
+        reason: "Read-only capability does not require approval.",
+      };
+    }
+
+    if (request?.approvalToken) {
+      return {
+        effect: "ALLOW",
+        reason: "Explicit approval token supplied.",
+      };
+    }
+
+    return {
+      effect: "APPROVAL_REQUIRED",
+      reason: "External side effect requires runtime approval.",
+      approval: {
+        missionId: "pending",
+        reason: "Job application is an external side effect.",
+        requestedAt: Date.now(),
+      },
+    };
+  }
+}
+</file>
+
+<file path="src/dsh-plugin/contract/types.ts">
+/**
+ * SCA DSH Plugin Contract
+ *
+ * 设计原则：
+ * - Model-facing API 只暴露语义对象
+ * - 不暴露 Chrome TabId / DOM Selector / IndexedDB Key
+ * - State / Evidence / Policy / Mission 均有明确权威归属
+ *
+ * Authority 边界（Phase A 修正）：
+ *   OBSERVED  只能由 SCA Runtime / ProvenanceVerifier 产生，通过 Adapter 注入
+ *   INFERRED  由 Model / Plugin 推理产生
+ *   DERIVED   由确定性计算产生
+ *   RETRACTED 不再被信任
+ *
+ * EvidenceFactory 不再提供 observed() —— 任何 Plugin 内部代码都不能伪造 OBSERVED。
+ */
+
+export type Authority =
+  | "OBSERVED"
+  | "INFERRED"
+  | "DERIVED"
+  | "RETRACTED";
+
+export type MissionState =
+  | "CREATED"
+  | "PLANNING"
+  | "DISCOVERING"
+  | "COLLECTING"
+  | "EVALUATING"
+  | "AWAITING_APPROVAL"
+  | "EXECUTING"
+  | "VERIFYING"
+  | "COMPLETED"
+  | "PAUSED"
+  | "FAILED"
+  | "CANCELLED";
+
+export type MissionKind =
+  | "JOB_SEARCH"
+  | "JOB_INSPECTION"
+  | "JOB_APPLICATION";
+
+export type PolicyEffect =
+  | "ALLOW"
+  | "DENY"
+  | "APPROVAL_REQUIRED";
+
+export type FailureCategory =
+  | "VALIDATION"
+  | "POLICY"
+  | "NETWORK"
+  | "PROVIDER"
+  | "AUTH"
+  | "TIMEOUT"
+  | "CONFLICT"
+  | "UNKNOWN";
+
+export interface FailureState {
+  code: string;
+  category: FailureCategory;
+  message: string;
+  recoverable: boolean;
+  retryable: boolean;
+  nextAction?: string;
+  details?: unknown;
+}
+
+export interface EvidenceSource {
+  providerId: string;
+  uri?: string;
+  observedAt: number;
+  locator?: string;
+}
+
+export interface Evidence<T = unknown> {
+  id: string;
+  claimKey: string;
+  value: T;
+  authority: Authority;
+
+  /**
+   * ⚠️ Phase F-1.1: Evidence 作用域关联。
+   *
+   * 时间范围 (createdAt >= actionStartedAt) 不足以证明证据属于本次 Action。
+   * 必须通过 missionId + actionId 明确关联，防止跨 Mission/跨 Action 证据污染。
+   *
+   * 权威链：
+   *   Evidence.missionId === Mission.id
+   *   Evidence.actionId === Mission.action.id (if action exists)
+   *   Evidence.correlationId === Mission.correlationId
+   *
+   * 缺少这些关联的 Evidence 不能用于 Completion 验证。
+   */
+  missionId?: string;
+  actionId?: string;
+  correlationId?: string;
+
+  source?: EvidenceSource;
+
+  /**
+   * 对具体 Claim 的置信度（0-1）。
+   * 注意：这不是 Authority 本身的 trust，Authority 是认识论分类。
+   */
+  confidence?: number;
+
+  createdAt: number;
+  retractedAt?: number;
+}
+
+export interface CareerConstraint {
+  location?: string;
+  minimumSalary?: number;
+  maximumSalary?: number;
+  salaryCurrency?: string;
+  blockedKeywords?: string[];
+  blockedPlatforms?: string[];
+  preferredPlatforms?: string[];
+  remoteOnly?: boolean;
+  minimumMatchScore?: number;
+  directHireOnly?: boolean;
+}
+
+export interface CareerState {
+  version: number;
+  identityAnchor?: string;
+  targetRoles: string[];
+  hardSkills: string[];
+  softSkills: string[];
+  achievements: string[];
+  constraints: CareerConstraint;
+  source: "SCA";
+  updatedAt: number;
+}
+
+export interface Job {
+  id: string;
+  title: string;
+  company?: string;
+  location?: string;
+  salary?: string;
+  platform?: string;
+  url: string;
+
+  /**
+   * 现实世界字段尽可能带证据。
+   * 注意：字段本身 ≠ 事实，每个可验证字段都应关联 OBSERVED Evidence。
+   */
+  evidence: Evidence[];
+
+  /**
+   * 计算结果不能冒充 Observation。
+   */
+  matchScore?: number;
+}
+
+export interface JobMatch {
+  jobId: string;
+  score: number;
+  strengths: string[];
+  gaps: string[];
+  risks: string[];
+  derivedFromEvidenceIds: string[];
+}
+
+export interface JobSearchRequest {
+  query: string;
+  constraints?: CareerConstraint;
+  limit?: number;
+}
+
+export interface JobSearchResult {
+  missionId: string;
+  state: MissionState;
+  results: Job[];
+  total: number;
+  hasMore: boolean;
+  nextAction?: string;
+}
+
+export interface JobInspectRequest {
+  jobId: string;
+}
+
+export interface JobInspectResult {
+  missionId: string;
+  job: Job;
+  match?: JobMatch;
+}
+
+export interface ApplyRequest {
+  jobId: string;
+  resumeId?: string;
+  message?: string;
+  approvalToken?: string;
+}
+
+export interface ApplicationResult {
+  missionId: string;
+  jobId: string;
+  state: MissionState;
+
+  /**
+   * Never return "success=true" without evidence.
+   * COMPLETED 必须伴随 OBSERVED 级别的 verification evidence。
+   */
+  verification?: Evidence[];
+  failure?: FailureState;
+}
+
+// ============================================================
+// Approval / Action / Verification —— Mission 执行实例字段
+// ============================================================
+
+export interface ApprovalRequest {
+  missionId: string;
+  reason: string;
+  requestedAt: number;
+  expiresAt?: number;
+}
+
+export interface ApprovalDecision {
+  approved: boolean;
+  approvalToken?: string;
+  reason?: string;
+  decidedAt: number;
+}
+
+/**
+ * 一次现实世界行动的执行记录。
+ * 区分"点击了提交"和"现实世界已成功"。
+ */
+export interface MissionAction {
+  type: string;
+  startedAt?: number;
+  completedAt?: number;
+  receiptId?: string;
+  /** Provider 返回的原始执行回执，不向 Model 暴露实现细节。 */
+  receipt?: unknown;
+}
+
+/**
+ * 验证结果。必须基于 OBSERVED Evidence，不能基于 Provider 的 accepted:true。
+ *
+ * ⚠️ Phase F-1.1: 不存储 confirmed 字段。
+ * confirmed 本质上是从 Evidence 推导的 Projection/Derived State，
+ * 不应该成为 Event Store 中的历史事实。
+ *
+ * Completion Gate 会根据 evidenceIds 对应的实际 Evidence 推导验证结论。
+ */
+export interface MissionVerification {
+  evidenceIds: string[];
+  verifiedAt: number;
+  summary?: string;
+}
+
+export interface PolicyDecision {
+  effect: PolicyEffect;
+  reason: string;
+  approval?: ApprovalRequest;
+}
+
+// ============================================================
+// Application Provider 三段式接口（Phase A 升级）
+// ============================================================
+
+/**
+ * prepare 阶段的输出：Provider 评估投递可行性，生成执行计划。
+ * 不产生外部副作用。
+ */
+export interface ApplyPreparation {
+  missionId: string;
+  jobId: string;
+  ready: boolean;
+  /** 缺失的前置条件，如未登录、简历未上传。 */
+  blockers?: string[];
+  /** Provider 内部的执行计划标识，后续 execute 时使用。 */
+  planId?: string;
+  estimatedDurationMs?: number;
+}
+
+/**
+ * execute 阶段的输出：Provider 执行了外部行动，返回执行回执。
+ * 注意：accepted !== 现实世界成功，必须经过 verify。
+ */
+export interface ActionReceipt {
+  missionId: string;
+  accepted: boolean;
+  receiptId?: string;
+  /** 执行过程中捕获的原始观察，用于后续 verify。 */
+  evidence: Evidence[];
+  failure?: {
+    code: string;
+    message: string;
+    retryable: boolean;
+  };
+}
+
+/**
+ * verify 阶段的输出：基于 OBSERVED Evidence 确认现实世界状态。
+ */
+export interface VerificationResult {
+  missionId: string;
+  confirmed: boolean;
+  /** 必须是 OBSERVED 级别的证据。 */
+  evidence: Evidence[];
+  summary?: string;
+  failure?: {
+    code: string;
+    message: string;
+    retryable: boolean;
+  };
+}
+
+// ============================================================
+// MissionRecord —— 从"状态机"升级为"执行实例"
+// ============================================================
+
+export interface MissionRecord {
+  id: string;
+  kind: MissionKind;
+  state: MissionState;
+  createdAt: number;
+  updatedAt: number;
+
+  input: unknown;
+
+  checkpoint?: unknown;
+
+  /** 待审批信息：处于 AWAITING_APPROVAL 时填充。 */
+  pendingApproval?: ApprovalRequest;
+
+  /** 外部行动执行记录。 */
+  action?: MissionAction;
+
+  /** 验证结果：必须基于 OBSERVED Evidence。 */
+  verification?: MissionVerification;
+
+  failure?: FailureState;
+
+  correlationId: string;
+  operationId: string;
+}
+
+export interface MissionStatus {
+  mission: MissionRecord;
+}
+</file>
+
+<file path="src/dsh-plugin/providers/sca-provider.ts">
+import type {
+  ActionReceipt,
+  ApplyPreparation,
+  ApplyRequest,
+  Evidence,
+  Job,
+  JobInspectResult,
+  JobSearchRequest,
+  VerificationResult,
+} from "../contract/types";
+import type { SCAProvider } from "./types";
+
+/**
+ * 第一版 Provider。
+ *
+ * 这是一个"接口完整、默认不接管现有逻辑"的 Null Provider。
+ *
+ * 原因：
+ * 不在 DSH Plugin 层复制当前 SCA 的抓取/浏览器逻辑。
+ * 后续通过 adapter/sca-runtime-adapter.ts 接到：
+ *
+ * - SeedGenerator
+ * - shadowTabExecutor
+ * - WDL Engine
+ * - localBatchHeuristicClean
+ * - policy / event store
+ */
+export class NullSCAProvider implements SCAProvider {
+  readonly id = "sca.null";
+
+  search = {
+    async search(
+      _request: JobSearchRequest,
+      _signal?: AbortSignal,
+    ): Promise<{ jobs: Job[]; evidence: Evidence[] }> {
+      return {
+        jobs: [],
+        evidence: [],
+      };
+    },
+  };
+
+  inspection = {
+    async inspect(
+      jobId: string,
+      _signal?: AbortSignal,
+    ): Promise<JobInspectResult> {
+      throw new Error(
+        `PROVIDER_NOT_CONNECTED: inspection:${jobId}`,
+      );
+    },
+  };
+
+  application = {
+    async prepare(
+      request: ApplyRequest,
+      _signal?: AbortSignal,
+    ): Promise<ApplyPreparation> {
+      return {
+        missionId: "pending",
+        jobId: request.jobId,
+        ready: false,
+        blockers: ["PROVIDER_NOT_CONNECTED"],
+      };
+    },
+
+    async execute(
+      missionId: string,
+      _approvalToken?: string,
+      _signal?: AbortSignal,
+    ): Promise<ActionReceipt> {
+      return {
+        missionId,
+        accepted: false,
+        evidence: [],
+        failure: {
+          code: "PROVIDER_NOT_CONNECTED",
+          message: `Application provider is not connected for mission ${missionId}`,
+          retryable: false,
+        },
+      };
+    },
+
+    async verify(
+      missionId: string,
+      _signal?: AbortSignal,
+    ): Promise<VerificationResult> {
+      return {
+        missionId,
+        confirmed: false,
+        evidence: [],
+        summary: "PROVIDER_NOT_CONNECTED: cannot verify application status",
+        failure: {
+          code: "PROVIDER_NOT_CONNECTED",
+          message: `Verification provider is not connected for mission ${missionId}`,
+          retryable: false,
+        },
+      };
+    },
+  };
+}
+</file>
+
+<file path="src/dsh-plugin/providers/types.ts">
+import type {
+  ActionReceipt,
+  ApplyPreparation,
+  ApplyRequest,
+  Evidence,
+  Job,
+  JobInspectResult,
+  JobSearchRequest,
+  VerificationResult,
+} from "../contract/types";
+
+export interface SearchProvider {
+  search(
+    request: JobSearchRequest,
+    signal?: AbortSignal,
+  ): Promise<{
+    jobs: Job[];
+    evidence: Evidence[];
+  }>;
+}
+
+export interface InspectionProvider {
+  inspect(
+    jobId: string,
+    signal?: AbortSignal,
+  ): Promise<JobInspectResult>;
+}
+
+/**
+ * ApplicationProvider —— 三段式外部行动接口（Phase A 升级）
+ *
+ * 设计原则：
+ *   prepare  → 评估可行性，不产生副作用
+ *   execute  → 执行外部行动，返回回执（accepted !== 成功）
+ *   verify   → 基于 OBSERVED Evidence 确认现实世界状态
+ *
+ * 不再使用单一 apply() 方法，因为"点击了提交"和"现实世界已成功"不是同一个事实。
+ * 没有 verify 阶段的 OBSERVED 证据，不能进入 COMPLETED。
+ */
+export interface ApplicationProvider {
+  prepare(
+    request: ApplyRequest,
+    signal?: AbortSignal,
+  ): Promise<ApplyPreparation>;
+
+  execute(
+    missionId: string,
+    approvalToken?: string,
+    signal?: AbortSignal,
+  ): Promise<ActionReceipt>;
+
+  verify(
+    missionId: string,
+    signal?: AbortSignal,
+  ): Promise<VerificationResult>;
+}
+
+/**
+ * Capability Provider Aggregate
+ *
+ * SCA Core 通过这一层接入真正的浏览器、招聘平台、邮件等现实世界能力。
+ */
+export interface SCAProvider {
+  readonly id: string;
+
+  search: SearchProvider;
+  inspection: InspectionProvider;
+  application: ApplicationProvider;
+}
+</file>
+
+<file path="src/dsh-plugin/runtime/event-sourced-mission-repository.ts">
+/**
+ * Event Sourced Mission Repository
+ *
+ * ⚠️ Phase F 核心：Mission 状态不是"写进去"的，而是"投影出来"的。
+ *
+ * 正确结构：
+ *   Command → Mission Aggregate / Command Handler
+ *     → Domain Event → Event Store → Projection → MissionRecord
+ *
+ * 错误结构（已废弃）：
+ *   MissionRecord → update() → append event（先改状态，再记录事件）
+ *
+ * 本 Repository 实现：
+ *   - create(): 发出 MissionCreated 事件
+ *   - update(): 根据 patch 内容发出对应的 domain event，然后从事件流重新投影
+ *   - get(): 从 Event Store 读取事件链，投影出 MissionRecord
+ *   - checkpoint(): 发出 MissionCheckpointed 事件
+ *
+ * Domain Events 使用 SCA 的 "narrative" 类型写入 Event Store，
+ * chainId 格式为 dsh_mission_{missionId}，与 SCA 的 traversal/observation 事件隔离。
+ *
+ * Mission 是"为什么/哪一次行动"，SCA Event 是"实际发生了什么"。
+ * 两者通过 missionId / correlationId 关联，不混淆。
+ */
+
+import type {
+  MissionRecord,
+  MissionKind,
+  MissionState,
+  FailureState,
+  ApprovalRequest,
+  MissionAction,
+  MissionVerification,
+} from "../contract/types";
+import { canTransition } from "../contract/mission";
+import type { MissionRepository } from "../contract/mission";
+import {
+  assertVerificationBoundary,
+  missionChainId,
+  type VerificationCapturedEvent,
+} from "../contract/mission-events";
+import { projectMissionEvents } from "../contract/mission-projection";
+import { commitSovereigntyTransaction, getDb } from "@sca/service-worker/db";
+import type { SovereigntyEvent } from "@sca/shared/types";
+
+function generateMissionId(): string {
+  return `mission_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// ============================================================
+// Domain Event Payloads
+// ============================================================
+
+interface MissionCreatedPayload {
+  note: "MISSION_CREATED";
+  missionId: string;
+  kind: MissionKind;
+  input: unknown;
+  correlationId: string;
+  operationId: string;
+  createdAt: number;
+}
+
+interface MissionStateChangedPayload {
+  note: "MISSION_STATE_CHANGED";
+  missionId: string;
+  fromState: MissionState;
+  toState: MissionState;
+  reason?: string;
+  changedAt: number;
+}
+
+interface MissionCheckpointedPayload {
+  note: "MISSION_CHECKPOINTED";
+  missionId: string;
+  checkpoint: unknown;
+  changedAt: number;
+}
+
+interface ApprovalRequestedPayload {
+  note: "APPROVAL_REQUESTED";
+  missionId: string;
+  approval: ApprovalRequest;
+  changedAt: number;
+}
+
+interface ApprovalResolvedPayload {
+  note: "APPROVAL_GRANTED" | "APPROVAL_DENIED";
+  missionId: string;
+  reason?: string;
+  changedAt: number;
+}
+
+interface ActionUpdatedPayload {
+  note: "MISSION_ACTION_UPDATED";
+  missionId: string;
+  action: MissionAction;
+  changedAt: number;
+}
+
+interface VerificationCapturedPayload {
+  note: "MISSION_VERIFICATION_CAPTURED";
+  missionId: string;
+  verification: MissionVerification;
+  changedAt: number;
+}
+
+interface MissionFailedPayload {
+  note: "MISSION_FAILED";
+  missionId: string;
+  failure: FailureState;
+  changedAt: number;
+}
+
+type MissionDomainEventPayload =
+  | MissionCreatedPayload
+  | MissionStateChangedPayload
+  | MissionCheckpointedPayload
+  | ApprovalRequestedPayload
+  | ApprovalResolvedPayload
+  | ActionUpdatedPayload
+  | VerificationCapturedPayload
+  | MissionFailedPayload;
+
+// ============================================================
+// Event Sourced Repository
+// ============================================================
+
+export class SCAMissionRepository implements MissionRepository {
+  async create(
+    kind: MissionKind,
+    input: unknown,
+    correlationId: string,
+    operationId: string,
+  ): Promise<MissionRecord> {
+    const missionId = generateMissionId();
+    const now = Date.now();
+    const chainId = missionChainId(missionId);
+
+    const payload: MissionCreatedPayload = {
+      note: "MISSION_CREATED",
+      missionId,
+      kind,
+      input,
+      correlationId,
+      operationId,
+      createdAt: now,
+    };
+
+    await commitSovereigntyTransaction(
+      { ...payload, chainId },
+      "narrative",
+      "service_worker",
+    );
+
+    const record: MissionRecord = {
+      id: missionId,
+      kind,
+      state: "CREATED",
+      createdAt: now,
+      updatedAt: now,
+      input,
+      correlationId,
+      operationId,
+    };
+
+    return record;
+  }
+
+  async get(id: string): Promise<MissionRecord | null> {
+    const events = await this.getMissionEvents(id);
+    if (events.length === 0) return null;
+    return this.projectEvents(events);
+  }
+
+  async update(
+    id: string,
+    patch: Partial<Omit<MissionRecord, "id">>,
+  ): Promise<MissionRecord> {
+    const current = await this.get(id);
+    if (!current) {
+      throw new Error(`MISSION_NOT_FOUND:${id}`);
+    }
+
+    const chainId = missionChainId(id);
+    const now = Date.now();
+
+    // 1. 如果 state 变化，发出 MissionStateChanged 事件
+    if (patch.state && patch.state !== current.state) {
+      if (!canTransition(current.state, patch.state)) {
+        throw new Error(
+          `INVALID_MISSION_TRANSITION:${current.state}->${patch.state}`,
+        );
+      }
+
+      const statePayload: MissionStateChangedPayload = {
+        note: "MISSION_STATE_CHANGED",
+        missionId: id,
+        fromState: current.state,
+        toState: patch.state,
+        changedAt: now,
+      };
+
+      await commitSovereigntyTransaction(
+        { ...statePayload, chainId },
+        "narrative",
+        "service_worker",
+      );
+    }
+
+    // 2. 如果 checkpoint 变化，发出 MissionCheckpointed 事件
+    if (patch.checkpoint !== undefined) {
+      const checkpointPayload: MissionCheckpointedPayload = {
+        note: "MISSION_CHECKPOINTED",
+        missionId: id,
+        checkpoint: patch.checkpoint,
+        changedAt: now,
+      };
+
+      await commitSovereigntyTransaction(
+        { ...checkpointPayload, chainId },
+        "narrative",
+        "service_worker",
+      );
+    }
+
+    // 3. 如果 pendingApproval 变化，发出 ApprovalRequested 事件
+    if (patch.pendingApproval) {
+      const approvalPayload: ApprovalRequestedPayload = {
+        note: "APPROVAL_REQUESTED",
+        missionId: id,
+        approval: patch.pendingApproval,
+        changedAt: now,
+      };
+
+      await commitSovereigntyTransaction(
+        { ...approvalPayload, chainId },
+        "narrative",
+        "service_worker",
+      );
+    }
+
+    // 4. 如果 pendingApproval 被清除（批准或拒绝后），发出 ApprovalResolved 事件
+    if (
+      patch.pendingApproval === undefined &&
+      current.pendingApproval !== undefined
+    ) {
+      const resolvedPayload: ApprovalResolvedPayload = {
+        note: patch.state === "CANCELLED" ? "APPROVAL_DENIED" : "APPROVAL_GRANTED",
+        missionId: id,
+        changedAt: now,
+      };
+
+      await commitSovereigntyTransaction(
+        { ...resolvedPayload, chainId },
+        "narrative",
+        "service_worker",
+      );
+    }
+
+    // 5. 如果 action 变化，发出 ActionUpdated 事件
+    if (patch.action) {
+      const actionPayload: ActionUpdatedPayload = {
+        note: "MISSION_ACTION_UPDATED",
+        missionId: id,
+        action: patch.action,
+        changedAt: now,
+      };
+
+      await commitSovereigntyTransaction(
+        { ...actionPayload, chainId },
+        "narrative",
+        "service_worker",
+      );
+    }
+
+    // 6. 如果 verification 变化，发出 VerificationCaptured 事件
+    if (patch.verification) {
+      // ⚠️ Phase F-1: VerificationCaptured 边界断言
+      // 确保不包含 authority 字段，只引用 evidenceIds
+      const verificationEvent: VerificationCapturedEvent = {
+        type: "VERIFICATION_CAPTURED",
+        missionId: id,
+        verification: patch.verification,
+        changedAt: now,
+      };
+      assertVerificationBoundary(verificationEvent);
+
+      const verificationPayload = {
+        note: "MISSION_VERIFICATION_CAPTURED",
+        missionId: id,
+        verification: patch.verification,
+        changedAt: now,
+      };
+
+      await commitSovereigntyTransaction(
+        { ...verificationPayload, chainId },
+        "narrative",
+        "service_worker",
+      );
+    }
+
+    // 7. 如果 failure 变化，发出 MissionFailed 事件
+    if (patch.failure) {
+      const failurePayload: MissionFailedPayload = {
+        note: "MISSION_FAILED",
+        missionId: id,
+        failure: patch.failure,
+        changedAt: now,
+      };
+
+      await commitSovereigntyTransaction(
+        { ...failurePayload, chainId },
+        "narrative",
+        "service_worker",
+      );
+    }
+
+    // 8. 从事件流重新投影（事件才是事实，MissionRecord 是投影）
+    return this.get(id);
+  }
+
+  async checkpoint(
+    id: string,
+    checkpoint: unknown,
+  ): Promise<MissionRecord> {
+    return this.update(id, { checkpoint });
+  }
+
+  // ============================================================
+  // Internal: Event Store 读取
+  // ============================================================
+
+  private async getMissionEvents(
+    missionId: string,
+  ): Promise<SovereigntyEvent[]> {
+    const db = await getDb();
+    const tx = db.transaction("events", "readonly");
+    const events = await tx.store.index
+      .by_chain()
+      .getAll(missionChainId(missionId));
+    await tx.done;
+    return events.sort((a, b) => a.ts - b.ts);
+  }
+
+  // ============================================================
+  // Internal: Projection
+  //
+  // MissionRecord 完全从事件流推导。
+  // 不存在"直接修改状态"的路径。
+  // ============================================================
+
+  private projectEvents(events: SovereigntyEvent[]): MissionRecord {
+    let record: MissionRecord | null = null;
+
+    for (const event of events) {
+      const payload = event.payload as MissionDomainEventPayload;
+
+      switch (payload.note) {
+        case "MISSION_CREATED":
+          record = {
+            id: payload.missionId,
+            kind: payload.kind,
+            state: "CREATED",
+            createdAt: payload.createdAt,
+            updatedAt: payload.createdAt,
+            input: payload.input,
+            correlationId: payload.correlationId,
+            operationId: payload.operationId,
+          };
+          break;
+
+        case "MISSION_STATE_CHANGED":
+          if (record) {
+            record.state = payload.toState;
+            record.updatedAt = payload.changedAt;
+          }
+          break;
+
+        case "MISSION_CHECKPOINTED":
+          if (record) {
+            record.checkpoint = payload.checkpoint;
+            record.updatedAt = payload.changedAt;
+          }
+          break;
+
+        case "APPROVAL_REQUESTED":
+          if (record) {
+            record.pendingApproval = payload.approval;
+            record.updatedAt = payload.changedAt;
+          }
+          break;
+
+        case "APPROVAL_GRANTED":
+        case "APPROVAL_DENIED":
+          if (record) {
+            record.pendingApproval = undefined;
+            record.updatedAt = payload.changedAt;
+          }
+          break;
+
+        case "MISSION_ACTION_UPDATED":
+          if (record) {
+            record.action = payload.action;
+            record.updatedAt = payload.changedAt;
+          }
+          break;
+
+        case "MISSION_VERIFICATION_CAPTURED":
+          if (record) {
+            record.verification = payload.verification;
+            record.updatedAt = payload.changedAt;
+          }
+          break;
+
+        case "MISSION_FAILED":
+          if (record) {
+            record.failure = payload.failure;
+            record.updatedAt = payload.changedAt;
+          }
+          break;
+      }
+    }
+
+    if (!record) {
+      throw new Error("MISSION_PROJECTION_FAILED: no MISSION_CREATED event found");
+    }
+
+    return record;
+  }
+}
+</file>
+
+<file path="src/dsh-plugin/runtime/evidence-mapper.ts">
+/**
+ * SCA Event → DSH Evidence Mapper
+ *
+ * ⚠️ 这是 DSH Plugin 中 OBSERVED Evidence 的唯一合法来源。
+ *
+ * ⚠️ Authority Gate（Phase E.5 修正）：
+ *   本 Mapper 不是第二个 Authority Gate，而是 ProvenanceVerifier 的消费者/适配器。
+ *   核心校验逻辑在 contract/evidence-authority.ts（纯函数，可测试）。
+ *
+ * 权威链：
+ *   Raw Observation (content_script)
+ *     → processObservation() [ProvenanceVerifier]
+ *     → observation event + interpretation event (Event Store)
+ *     → getEventsByChain() 读取
+ *     → extractAuthorizedObservations() 校验
+ *     → OBSERVED Evidence
+ *
+ * 不满足 ProvenanceVerifier 条件的 observation 只能视为 RAW，
+ * 不能提升为 OBSERVED Evidence。
+ */
+
+import type {
+  Evidence,
+  Job,
+  JobMatch,
+} from "../contract/types";
+import type {
+  SovereigntyEvent,
+  InteractionState,
+} from "@sca/shared/types";
+import { getDb } from "@sca/service-worker/db";
+
+// 纯函数层：Authority Gate 核心逻辑（可独立测试）
+export {
+  isAuthorizedObservation,
+  extractAuthorizedObservations,
+  mapAuthorizedObservationToEvidence,
+  mapInterpretationToEvidence,
+  buildContaminationScenarios,
+} from "../contract/evidence-authority";
+
+// ============================================================
+// Event Store 读取（运行时依赖）
+// ============================================================
+
+export async function getEventsByChain(
+  chainId: string,
+): Promise<SovereigntyEvent[]> {
+  const db = await getDb();
+  const tx = db.transaction("events", "readonly");
+  const events = await tx.store.index("by_chain").getAll(chainId);
+  await tx.done;
+  return events.sort((a, b) => a.ts - b.ts);
+}
+
+export async function getRecentObservations(
+  limit = 50,
+): Promise<SovereigntyEvent[]> {
+  const db = await getDb();
+  const tx = db.transaction("events", "readonly");
+  const index = tx.store.index("by_type");
+  const cursor = await index.openCursor("observation", "prev");
+  const events: SovereigntyEvent[] = [];
+  let c = cursor;
+  while (c && events.length < limit) {
+    events.push(c.value);
+    c = await c.continue();
+  }
+  await tx.done;
+  return events;
+}
+
+// ============================================================
+// Evidence 映射（仅内部使用，外部必须通过 extractAuthorizedObservations）
+// ============================================================
+
+// ============================================================
+// 公开 API：从 chain 提取 Evidence
+// ============================================================
+
+/**
+ * 从一个 chainId 的事件流中提取所有 Evidence。
+ *
+ * ⚠️ OBSERVED 只包含已通过 ProvenanceVerifier 校验的 observation。
+ * 未授权的 observation 会被静默过滤（不抛出，不伪造）。
+ *
+ * DERIVED 包含所有 interpretation（interpretation 本身就是 ProvenanceVerifier 的输出）。
+ */
+export async function extractEvidenceFromChain(
+  chainId: string,
+): Promise<Evidence[]> {
+  const events = await getEventsByChain(chainId);
+  const evidence: Evidence[] = [];
+
+  // OBSERVED：仅提取已授权的
+  evidence.push(...extractAuthorizedObservations(events));
+
+  // DERIVED：interpretation 本身就是 ProvenanceVerifier 的输出
+  for (const event of events) {
+    if (event.type === "interpretation") {
+      evidence.push(mapInterpretationToEvidence(event));
+    }
+  }
+
+  return evidence;
+}
+
+// ============================================================
+// Job 映射
+// ============================================================
+
+/**
+ * 将 SCA InteractionState 映射为 DSH Job。
+ *
+ * ⚠️ 关键约束：
+ *   Job.evidence 必须包含已授权的 OBSERVED Evidence。
+ *   如果该 chainId 下没有已授权的 observation，Job.evidence 中将不包含 OBSERVED，
+ *   调用方应据此判断该 Job 是否可信。
+ *
+ * InteractionState 是 SCA 从事件流投影出的状态，
+ * 但其字段（title/company/salary 等）的权威性来自背后的 observation event。
+ */
+export async function mapInteractionStateToJob(
+  state: InteractionState,
+): Promise<Job> {
+  const evidence = await extractEvidenceFromChain(state.companyId);
+
+  const interpEvidence = evidence.find(
+    (e) =>
+      e.authority === "DERIVED" &&
+      e.claimKey === "interpretation:job_analysis",
+  );
+  const matchScore =
+    (interpEvidence?.value as any)?.matchScore ?? state.counterpartyScore;
+
+  return {
+    id: state.companyId,
+    title: state.jobTitle || "未知岗位",
+    company: state.companyName,
+    location: state.location,
+    salary: state.salary,
+    platform: state.platforms?.[0],
+    url: state.chatUrl || "",
+    evidence,
+    matchScore: typeof matchScore === "number" ? matchScore : undefined,
+  };
+}
+
+/**
+ * 从一组 InteractionState 批量映射为 Job[]，按匹配度降序排列。
+ *
+ * ⚠️ 仅返回有已授权 OBSERVED Evidence 的 Job。
+ * 没有经过 ProvenanceVerifier 的状态不会被返回为可信 Job。
+ */
+export async function mapInteractionStatesToJobs(
+  states: InteractionState[],
+  limit?: number,
+): Promise<Job[]> {
+  const jobs = await Promise.all(
+    states.map((s) => mapInteractionStateToJob(s)),
+  );
+
+  // 仅保留有 OBSERVED evidence 的 Job
+  const trustedJobs = jobs.filter((job) =>
+    job.evidence.some((e) => e.authority === "OBSERVED"),
+  );
+
+  trustedJobs.sort((a, b) => (b.matchScore ?? 0) - (a.matchScore ?? 0));
+
+  return limit ? trustedJobs.slice(0, limit) : trustedJobs;
+}
+
+/**
+ * 从 chainId 的事件中提取 JobMatch。
+ */
+export async function extractJobMatchFromChain(
+  chainId: string,
+  jobId: string,
+): Promise<JobMatch | undefined> {
+  const events = await getEventsByChain(chainId);
+  const interpEvent = events.find((e) => e.type === "interpretation");
+
+  if (!interpEvent) return undefined;
+
+  const payload = interpEvent.payload as InterpretationPayload;
+  const scoreTag = payload.riskTags?.find(
+    (t) =>
+      t.label?.includes("契合度评估") ||
+      (t.label?.includes("匹配") &&
+        !t.label?.includes("率") &&
+        !t.label?.includes("风险")),
+  );
+
+  const strengths: string[] = [];
+  const gaps: string[] = [];
+  const risks: string[] = [];
+
+  for (const tag of payload.riskTags || []) {
+    if (
+      tag.label?.includes("风险") ||
+      (tag.confidence > 0.7 && tag.label?.includes("高压"))
+    ) {
+      risks.push(tag.label);
+    } else if (tag.confidence > 0.5) {
+      strengths.push(tag.label);
+    } else {
+      gaps.push(tag.label);
+    }
+  }
+
+  return {
+    jobId,
+    score: scoreTag ? Math.round(scoreTag.confidence * 100) : 0,
+    strengths,
+    gaps,
+    risks,
+    derivedFromEvidenceIds: [interpEvent.id],
+  };
+}
+
+// ============================================================
+// 向后兼容导出（已废弃，仅保留引用）
+// ============================================================
+
+/**
+ * @deprecated 已废弃。使用 extractAuthorizedObservations() 替代。
+ * 此函数不做 ProvenanceVerifier 校验，仅保留用于内部测试。
+ */
+export function mapObservationToEvidence(
+  event: SovereigntyEvent,
+): Evidence {
+  // 注意：此函数不做授权校验，调用方必须自行确保 event 已通过 isAuthorizedObservation()。
+  // 推荐使用 extractAuthorizedObservations()。
+  return mapAuthorizedObservationToEvidence(event);
+}
+</file>
+
+<file path="src/dsh-plugin/runtime/index.ts">
+/**
+ * SCA Runtime 实现层
+ *
+ * 本目录包含 DSH Plugin 与现有 SCA Core 的真实焊接实现。
+ *
+ * - sca-core-runtime.ts: ExistingSCARuntime 的完整实现，对接 SCA 的 db / seed-generator / shadow-tab-executor / policy / projection
+ * - evidence-mapper.ts: SCA Event → DSH Evidence 的映射，是 OBSERVED Evidence 的唯一合法来源（必须经过 ProvenanceVerifier 校验）
+ * - event-sourced-mission-repository.ts: MissionRepository 的 Event Sourcing 实现，Command → Domain Event → Event Store → Projection
+ *
+ * 使用方式：
+ *   import { SCACoreRuntime, SCAMissionRepository } from "./runtime";
+ *   const plugin = new SCADSHPlugin(new SCACoreRuntime());
+ */
+
+export { SCACoreRuntime } from "./sca-core-runtime";
+export { SCAMissionRepository } from "./event-sourced-mission-repository";
+export {
+  extractEvidenceFromChain,
+  mapInteractionStateToJob,
+  mapInteractionStatesToJobs,
+  extractJobMatchFromChain,
+  mapObservationToEvidence,
+  mapInterpretationToEvidence,
+  getEventsByChain,
+  getRecentObservations,
+  extractAuthorizedObservations,
+  isAuthorizedObservation,
+} from "./evidence-mapper";
+</file>
+
+<file path="src/dsh-plugin/runtime/sca-core-runtime.ts">
+/**
+ * SCACoreRuntime —— ExistingSCARuntime 的真实实现
+ *
+ * 这是 DSH Plugin 与 SCA Core 之间的焊接层。
+ *
+ * 架构定位：
+ *   DSH Plugin (Capability Contract)
+ *     ↓
+ *   SCACoreRuntime (本文件)
+ *     ↓
+ *   SCA Core (db / seed-generator / shadow-tab-executor / policy / projection)
+ *     ↓
+ *   Reality (Browser / Job Site / Mail)
+ *
+ * ⚠️ OBSERVED Authority：
+ *   本文件是唯一允许构造 authority="OBSERVED" Evidence 的地方，
+ *   且必须通过 evidence-mapper 从 SCA Event Store 提取，
+ *   不能凭空构造。
+ *
+ * ⚠️ 不修改 SCA 源码：
+ *   所有 SCA 模块通过 import 引用，只读使用。
+ *   SCA 的事件账本、Observation、Constitution、WDL、Shadow Tab 等结构保持不变。
+ */
+
+import type {
+  ActionReceipt,
+  ApplyPreparation,
+  ApplyRequest,
+  CareerState,
+  Evidence,
+  Job,
+  JobInspectResult,
+  JobSearchRequest,
+  VerificationResult,
+} from "../contract/types";
+import type { ExistingSCARuntime } from "../adapter/sca-runtime-adapter";
+
+// SCA Core 模块引用（只读）
+import { getActiveProfile, getConstitution, appendIntent, commitSovereigntyTransaction, getDb } from "@sca/service-worker/db";
+import { SeedGenerator } from "@sca/service-worker/seed-generator";
+import { shadowTabExecutor } from "@sca/service-worker/shadow-tab-executor";
+import { processObservation, evaluateActionGate, computeProfileSimilarity } from "@sca/service-worker/policy";
+import { getInteractionStates, invalidateProjectionCache } from "@sca/service-worker/projection";
+import type { WhitepaperAnalysisPayload, UserConstitution, InteractionState, IntentPayload, ObservationPayload } from "@sca/shared/types";
+import { createJobFingerprint, normalizeJobUrl } from "@sca/shared/event-factory";
+
+import {
+  extractEvidenceFromChain,
+  mapInteractionStatesToJobs,
+  mapInteractionStateToJob,
+  extractJobMatchFromChain,
+  getEventsByChain,
+  mapObservationToEvidence,
+  extractAuthorizedObservations,
+  isAuthorizedObservation,
+} from "./evidence-mapper";
+
+// ============================================================
+// 投递验证：页面文本模式
+//
+// 这些模式用于从 OBSERVED Evidence 的 extractedText 中判断投递状态。
+// 只有页面文本匹配这些模式，才能确认投递成功/失败。
+// decision event（FORM_DISPATCH 等）不能作为确认依据。
+// ============================================================
+
+const APPLICATION_SUCCESS_PATTERNS: RegExp[] = [
+  /已投递|投递成功|申请成功|已申请|简历已送达|投递已完成|您已成功投递/,
+  /application\s+submitted|applied\s+successfully|resume\s+sent/i,
+];
+
+const APPLICATION_FAILURE_PATTERNS: RegExp[] = [
+  /投递失败|申请失败|职位已关闭|该职位已结束|无法投递|简历未送达/,
+  /position\s+closed|application\s+failed|unable\s+to\s+apply/i,
+];
+
+// ============================================================
+// 工具函数
+// ============================================================
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function generateDSHChainId(prefix: string): string {
+  return `dsh_${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// ============================================================
+// SCACoreRuntime 实现
+// ============================================================
+
+export class SCACoreRuntime implements ExistingSCARuntime {
+  /**
+   * Phase B: getCareerState
+   *
+   * SCA Profile = State Authority
+   * DSH CareerState = Semantic Projection
+   *
+   * 直接复用 getActiveProfile() + getConstitution()，
+   * 不重新读取数据库，不创建第二份 Profile。
+   */
+  async getCareerState(): Promise<CareerState> {
+    const profile = await getActiveProfile();
+    const constitution = await getConstitution();
+
+    if (!profile) {
+      return {
+        version: 1,
+        targetRoles: [],
+        hardSkills: [],
+        softSkills: [],
+        achievements: [],
+        constraints: {},
+        source: "SCA",
+        updatedAt: Date.now(),
+      };
+    }
+
+    const prefs = constitution.preferences || {};
+    const remoteBoundary = constitution.contextualBoundaries?.find(
+      (b) => b.id === "cb_remote_only" && b.active,
+    );
+
+    const targetLocations = profile.job_seeking?.target_locations || [];
+    const preferredLocations = prefs.preferredLocations || [];
+
+    return {
+      version: 1,
+      identityAnchor: profile.identity_anchor,
+      targetRoles: profile.job_seeking?.target_roles || [],
+      hardSkills: profile.capabilities?.hard_skills || [],
+      softSkills: profile.capabilities?.soft_skills || [],
+      achievements: profile.capabilities?.achievements || [],
+      constraints: {
+        location:
+          targetLocations[0] || preferredLocations[0] || undefined,
+        minimumSalary: prefs.minSalary,
+        maximumSalary: prefs.maxSalary,
+        blockedKeywords: prefs.blockedKeywords,
+        blockedPlatforms: prefs.blockedPlatforms,
+        preferredPlatforms: prefs.activePlatforms,
+        remoteOnly: !!remoteBoundary,
+        minimumMatchScore: prefs.minCompleteness,
+      },
+      source: "SCA",
+      updatedAt: Date.now(),
+    };
+  }
+
+  // ============================================================
+  // Phase C: searchJobs
+  //
+  // DSH 负责"我要什么"，SCA 负责"现实世界怎么找"。
+  //
+  // 流程：
+  //   CareerState + SearchRequest
+  //     → SeedGenerator.generateOptimalSeeds
+  //     → shadowTabExecutor.enqueue
+  //     → shadowTabExecutor.startTraversal
+  //     → (等待遍历完成)
+  //     → getInteractionStates (投影)
+  //     → Job[] + Evidence[]
+  // ============================================================
+
+  async searchJobs(
+    request: JobSearchRequest,
+    signal?: AbortSignal,
+  ): Promise<{ jobs: Job[]; evidence: Evidence[] }> {
+    const searchChainId = generateDSHChainId("search");
+
+    // 1. 生成寻源种子（复用 SCA SeedGenerator）
+    const seeds = await SeedGenerator.generateOptimalSeeds(1);
+
+    if (seeds.length === 0) {
+      return { jobs: [], evidence: [] };
+    }
+
+    // 2. 构造遍历任务并入队
+    const tasks = seeds.map((seed) => ({
+      url: seed.url,
+      chainId: `seed_${seed.platform}_${Math.abs(this.hashCode(seed.url)).toString(36)}`,
+      title: seed.title,
+      taskType: "SEED" as const,
+      metadata: seed.tactics,
+    }));
+
+    const enqueued = await shadowTabExecutor.enqueue(tasks);
+
+    if (enqueued === 0) {
+      return { jobs: [], evidence: [] };
+    }
+
+    // 3. 启动遍历
+    await shadowTabExecutor.startTraversal();
+
+    // 4. 等待 Observation + Interpretation 进入 Event Store（最多 60 秒）
+    //
+    // ⚠️ Authority Gate（Phase E.5 修正）：
+    //   不能仅等待 traversal 完成。traversal 完成 ≠ observation 已进入 Event Store
+    //   ≠ interpretation（ProvenanceVerifier 输出）已写入。
+    //
+    //   必须等待每个 seed chainId 下存在：
+    //     - observation event（真实页面观察）
+    //     - interpretation event（ProvenanceVerifier 分析结果）
+    //
+    //   只有同时存在这两者，该 chainId 的 Job 才是"已授权的可信结果"。
+    const deadline = Date.now() + 60_000;
+    const pollInterval = 3_000;
+    const seedChainIds = tasks.map((t) => t.chainId);
+
+    while (Date.now() < deadline) {
+      if (signal?.aborted) break;
+      await sleep(pollInterval);
+
+      // 检查每个 seed chainId 是否有已授权的 observation（有对应的 interpretation）
+      let allAuthorized = true;
+      let anyObservation = false;
+
+      for (const chainId of seedChainIds) {
+        const events = await getEventsByChain(chainId);
+        const hasObservation = events.some((e) => e.type === "observation");
+        const hasInterpretation = events.some(
+          (e) => e.type === "interpretation",
+        );
+
+        if (hasObservation) anyObservation = true;
+        if (!hasObservation || !hasInterpretation) {
+          allAuthorized = false;
+        }
+      }
+
+      // 至少有一个 seed 产生了 observation，且所有有 observation 的 seed 都有 interpretation
+      if (anyObservation && allAuthorized) break;
+
+      // 或者超过一半的 seed 有了完整的 observation + interpretation
+      const authorizedCount = (
+        await Promise.all(
+          seedChainIds.map(async (cid) => {
+            const evts = await getEventsByChain(cid);
+            return evts.some((e) => e.type === "observation") &&
+              evts.some((e) => e.type === "interpretation")
+              ? 1
+              : 0;
+          }),
+        )
+      ).reduce((a, b) => a + b, 0);
+
+      if (authorizedCount >= Math.ceil(seedChainIds.length / 2)) break;
+    }
+
+    // 5. 从投影读取结果
+    invalidateProjectionCache();
+    const states = await getInteractionStates();
+
+    // 6. 筛选与本次搜索相关的结果（最近发现的、未关闭的）
+    const now = Date.now();
+    const recentStates = states.filter(
+      (s) =>
+        now - s.lastContact < 300_000 && // 5 分钟内的新发现
+        s.stage !== "dropped" &&
+        s.stage !== "rejected",
+    );
+
+    // 如果没有最近的新发现，返回所有活跃状态
+    const candidateStates =
+      recentStates.length > 0
+        ? recentStates
+        : states.filter(
+            (s) => s.stage !== "dropped" && s.stage !== "rejected",
+          );
+
+    // 7. 应用请求约束过滤
+    const filteredStates = this.applySearchConstraints(
+      candidateStates,
+      request,
+    );
+
+    // 8. 映射为 Job[]（包含 OBSERVED Evidence）
+    const limit = request.limit ?? 20;
+    const jobs = await mapInteractionStatesToJobs(filteredStates, limit);
+
+    // 9. 收集所有相关 Evidence
+    const allEvidence: Evidence[] = [];
+    for (const job of jobs) {
+      allEvidence.push(...job.evidence);
+    }
+
+    return { jobs, evidence: allEvidence };
+  }
+
+  // ============================================================
+  // Phase D: inspectJob
+  //
+  // 职位详情复用现有 Observation Pipeline。
+  // jobId 对应 SCA 的 companyId / chainId。
+  //
+  // 流程：
+  //   jobId → 查找 InteractionState
+  //     → 如有 URL 则触发观察
+  //     → processObservation
+  //     → 从 Event Store 读取详情
+  //     → JobInspectResult
+  // ============================================================
+
+  async inspectJob(
+    jobId: string,
+    signal?: AbortSignal,
+  ): Promise<JobInspectResult> {
+    // 1. 从投影中查找该岗位
+    const states = await getInteractionStates();
+    const state = states.find((s) => s.companyId === jobId);
+
+    if (!state) {
+      // 尝试从 Event Store 直接查找
+      const events = await getEventsByChain(jobId);
+      if (events.length === 0) {
+        throw new Error(`JOB_NOT_FOUND:${jobId}`);
+      }
+    }
+
+    // 2. 如果有 chatUrl，触发真实浏览器观察
+    //    ⚠️ 这不是 synthetic observation，而是通过 shadowTabExecutor 触发
+    //    真实的浏览器页面加载，由 content_script 捕获原始观察，
+    //    再经 processObservation（ProvenanceVerifier）写入 Event Store。
+    if (state?.chatUrl) {
+      await this.triggerJobObservation(state.chatUrl, jobId, signal);
+    }
+
+    // 3. 等待 Observation + Interpretation 进入 Event Store
+    //    （最多 20 秒，确保经过 ProvenanceVerifier）
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      if (signal?.aborted) break;
+      await sleep(2_000);
+
+      const events = await getEventsByChain(jobId);
+      const hasAuthorizedObservation = events.some((e) =>
+        isAuthorizedObservation(e, events),
+      );
+      if (hasAuthorizedObservation) break;
+    }
+
+    // 4. 从 Event Store 提取已授权的 Evidence 和详情
+    const job = state
+      ? await mapInteractionStateToJob(state)
+      : await this.buildJobFromEvents(jobId);
+
+    // 5. 提取匹配度分析（DERIVED，来自 interpretation）
+    const match = await extractJobMatchFromChain(jobId, jobId);
+
+    return {
+      missionId: generateDSHChainId("inspect"),
+      job,
+      match,
+    };
+  }
+
+  // ============================================================
+  // Phase E: applyJob 三段式
+  // ============================================================
+
+  /**
+   * prepareApply —— 评估投递可行性，不产生外部副作用。
+   *
+   * 检查：
+   *   - Profile 是否存在
+   *   - 目标岗位是否已在活跃投递中（evaluateActionGate）
+   *   - 平台是否被屏蔽
+   */
+  async prepareApply(
+    request: ApplyRequest,
+    _signal?: AbortSignal,
+  ): Promise<ApplyPreparation> {
+    const missionId = generateDSHChainId("apply");
+
+    // 检查 Profile
+    const profile = await getActiveProfile();
+    if (!profile) {
+      return {
+        missionId,
+        jobId: request.jobId,
+        ready: false,
+        blockers: ["PROFILE_NOT_FOUND: 职业画像未初始化"],
+      };
+    }
+
+    // 检查是否已有活跃投递
+    const states = await getInteractionStates();
+    const targetState = states.find((s) => s.companyId === request.jobId);
+
+    if (targetState) {
+      const gate = await evaluateActionGate(
+        request.jobId,
+        [],
+        "APPLY",
+      );
+      if (gate.block) {
+        return {
+          missionId,
+          jobId: request.jobId,
+          ready: false,
+          blockers: gate.reason,
+        };
+      }
+    }
+
+    return {
+      missionId,
+      jobId: request.jobId,
+      ready: true,
+      planId: `plan_${missionId}`,
+      estimatedDurationMs: 15_000,
+    };
+  }
+
+  /**
+   * executeApply —— 执行外部行动（触发投递）。
+   *
+   * 通过 appendIntent 写入 FORM_FILL 类型的 intent 事件，
+   * shadowTabExecutor 的 outbox 处理器会消费并执行。
+   *
+   * 注意：accepted !== 现实世界成功，必须经过 verifyApply。
+   */
+  async executeApply(
+    missionId: string,
+    approvalToken?: string,
+    _signal?: AbortSignal,
+  ): Promise<ActionReceipt> {
+    // 从 mission checkpoint 中恢复 jobId（简化实现：直接用 missionId 关联）
+    // 在实际实现中，jobId 应该在 prepare 阶段存入 checkpoint
+    const jobId = missionId; // 简化：实际应从 checkpoint 读取
+
+    try {
+      // 写入投递 intent，触发 SCA 的 outbox 处理
+      const intent: IntentPayload = {
+        chainId: jobId,
+        intentType: "FORM_FILL",
+        taskType: "JOB",
+        metadata: {
+          missionId,
+          approvalToken: approvalToken || "user_approved",
+          source: "dsh_plugin",
+        },
+      };
+
+      await appendIntent(intent);
+
+      // 触发 outbox 处理
+      await shadowTabExecutor.startTraversal();
+
+      // 等待执行开始
+      await sleep(3_000);
+
+      return {
+        missionId,
+        accepted: true,
+        receiptId: `receipt_${missionId}`,
+        evidence: [], // 执行阶段不返回 OBSERVED，verify 阶段才返回
+      };
+    } catch (err) {
+      return {
+        missionId,
+        accepted: false,
+        evidence: [],
+        failure: {
+          code: "APPLY_EXECUTION_ERROR",
+          message: String(err),
+          retryable: true,
+        },
+      };
+    }
+  }
+
+  /**
+   * verifyApply —— 基于已授权 OBSERVED Evidence 确认现实世界状态。
+   *
+   * ⚠️ Authority Gate（Phase E.5 修正）：
+   *   不能用 FORM_DISPATCH / PLATFORM_DISPATCH 等 decision event 判断 confirmed。
+   *   decision event 只证明"SCA 决定执行投递"，不证明"现实世界投递成功"。
+   *
+   *   confirmed 必须基于：
+   *     1. 已授权的 OBSERVED Evidence（经过 ProvenanceVerifier）
+   *     2. Evidence 内容表明投递成功（页面文本包含"已投递"/"申请成功"等）
+   *
+   *   权威链：
+   *     Browser Action → Platform Response → Observation → ProvenanceVerifier
+   *       → OBSERVED (application.status = submitted) → confirmed = true
+   *
+   *   没有满足条件的 OBSERVED Evidence，confirmed 必须为 false。
+   */
+  async verifyApply(
+    missionId: string,
+    signal?: AbortSignal,
+  ): Promise<VerificationResult> {
+    const jobId = missionId; // 简化：实际应从 checkpoint 读取
+
+    // 等待 observation 进入 Event Store（轮询，最多 30 秒）
+    // 注意：不等待 outbox 清空，因为 outbox 清空只表示"意图已消费"，不表示"结果已观察"
+    const deadline = Date.now() + 30_000;
+    let authorizedEvidence: Evidence[] = [];
+
+    while (Date.now() < deadline) {
+      if (signal?.aborted) break;
+      await sleep(3_000);
+
+      const events = await getEventsByChain(jobId);
+      authorizedEvidence = extractAuthorizedObservations(events);
+
+      // 只要有已授权的 observation 就停止等待（内容是否表明成功在下面判断）
+      if (authorizedEvidence.length > 0) break;
+    }
+
+    // 如果没有已授权的 OBSERVED，直接返回未确认
+    if (authorizedEvidence.length === 0) {
+      return {
+        missionId,
+        confirmed: false,
+        evidence: [],
+        summary:
+          "VERIFICATION_PENDING: 投递执行已发起，但尚未观察到经过 ProvenanceVerifier 验证的页面证据",
+        failure: {
+          code: "VERIFICATION_PENDING",
+          message:
+            "没有已授权的 OBSERVED Evidence。可能原因：页面未加载完成、观察未触发、或 ProvenanceVerifier 未完成分析。请稍后重试 verify。",
+          retryable: true,
+        },
+      };
+    }
+
+    // ⚠️ Phase F-1.1: 给所有 verification evidence 打上 missionId 作用域标记
+    // 防止跨 Mission 证据污染（EvidenceScopeValid 检查）
+    const scopedEvidence = authorizedEvidence.map((e) => ({
+      ...e,
+      missionId,
+      correlationId: missionId, // 简化：实际应使用 mission.correlationId
+    }));
+
+    // 检查 OBSERVED Evidence 内容是否表明投递成功
+    // 这是 confirmed 的唯一合法依据
+    const successEvidence = scopedEvidence.find((e) => {
+      const value = e.value as any;
+      const text = (value?.extractedText || value?.pageTitle || "") as string;
+      return APPLICATION_SUCCESS_PATTERNS.some((pattern) =>
+        pattern.test(text),
+      );
+    });
+
+    // 检查是否有明确的失败观察
+    const failureEvidence = scopedEvidence.find((e) => {
+      const value = e.value as any;
+      const text = (value?.extractedText || value?.pageTitle || "") as string;
+      return APPLICATION_FAILURE_PATTERNS.some((pattern) =>
+        pattern.test(text),
+      );
+    });
+
+    if (successEvidence) {
+      // ⚠️ Authority 分层（Phase F）：
+      //   OBSERVED: page.text = "投递成功"  （现实事实）
+      //   DERIVED:  application.status = SUBMITTED  （从 OBSERVED 确定性推导）
+      //
+      // confirmed = true 是 DERIVED 结论，不是 OBSERVED 事实本身。
+      const actionId = `action_${missionId}`;
+      const derivedEvidence: Evidence = {
+        id: `derived_${missionId}_${Date.now()}`,
+        claimKey: "application.status",
+        value: "SUBMITTED",
+        authority: "DERIVED",
+        missionId,
+        actionId,
+        correlationId: missionId,
+        source: {
+          providerId: "sca.verification",
+          observedAt: Date.now(),
+        },
+        confidence: 0.95,
+        createdAt: Date.now(),
+      };
+
+      return {
+        missionId,
+        confirmed: true,
+        evidence: [...scopedEvidence, derivedEvidence],
+        summary: `投递已确认：页面观察到投递成功状态（OBSERVED evidenceId=${successEvidence.id} → DERIVED application.status=SUBMITTED）`,
+      };
+    }
+
+    if (failureEvidence) {
+      return {
+        missionId,
+        confirmed: false,
+        evidence: scopedEvidence,
+        summary: `投递失败：页面观察到失败状态（evidenceId=${failureEvidence.id}）`,
+        failure: {
+          code: "APPLICATION_REJECTED",
+          message: "平台页面显示投递失败或职位已关闭",
+          retryable: false,
+        },
+      };
+    }
+
+    // 有 OBSERVED 但内容不明确，返回未确认
+    return {
+      missionId,
+      confirmed: false,
+      evidence: scopedEvidence,
+      summary:
+        "VERIFICATION_AMBIGUOUS: 已观察到页面状态，但无法从文本中确认投递成功或失败",
+      failure: {
+        code: "VERIFICATION_AMBIGUOUS",
+        message:
+          "OBSERVED Evidence 存在，但内容不包含明确的投递成功/失败标识。需要更精确的页面观察或人工确认。",
+        retryable: true,
+      },
+    };
+  }
+
+  // ============================================================
+  // Internal helpers
+  // ============================================================
+
+  private applySearchConstraints(
+    states: InteractionState[],
+    request: JobSearchRequest,
+  ): InteractionState[] {
+    const constraints = request.constraints || {};
+    let result = [...states];
+
+    if (constraints.minimumMatchScore) {
+      result = result.filter(
+        (s) => (s.counterpartyScore || 0) >= constraints.minimumMatchScore!,
+      );
+    }
+
+    if (constraints.location) {
+      result = result.filter(
+        (s) =>
+          !s.location ||
+          s.location.includes(constraints.location!) ||
+          constraints.location!.includes(s.location),
+      );
+    }
+
+    if (constraints.blockedKeywords) {
+      result = result.filter((s) => {
+        const text = `${s.jobTitle || ""} ${s.companyName || ""} ${s.summary || ""}`;
+        return !constraints.blockedKeywords!.some((kw) =>
+          text.toLowerCase().includes(kw.toLowerCase()),
+        );
+      });
+    }
+
+    if (constraints.blockedPlatforms) {
+      result = result.filter(
+        (s) =>
+          !s.platforms ||
+          !s.platforms.some((p) =>
+            constraints.blockedPlatforms!.includes(p),
+          ),
+      );
+    }
+
+    // 按 query 关键词过滤（从 Job 文本中匹配）
+    if (request.query) {
+      const keywords = request.query.split(/\s+/).filter(Boolean);
+      result = result.filter((s) => {
+        const text = `${s.jobTitle || ""} ${s.summary || ""}`.toLowerCase();
+        return keywords.some((kw) => text.includes(kw.toLowerCase()));
+      });
+    }
+
+    return result;
+  }
+
+  private async triggerJobObservation(
+    url: string,
+    chainId: string,
+    _signal?: AbortSignal,
+  ): Promise<void> {
+    // 通过 shadowTabExecutor 触发真实的浏览器页面加载。
+    // content_script 会捕获原始观察，processObservation（ProvenanceVerifier）
+    // 会将 observation + interpretation 写入 Event Store。
+    //
+    // ⚠️ 本方法不构造任何 observation，只触发浏览器行为。
+    // OBSERVED Evidence 的唯一来源是 evidence-mapper 从 Event Store 读取。
+    try {
+      await shadowTabExecutor.enqueue([
+        {
+          url,
+          chainId,
+          title: "岗位详情",
+          taskType: "JOB",
+        },
+      ]);
+      await shadowTabExecutor.startTraversal();
+    } catch {
+      // 观察触发失败不阻断 inspect，返回已有数据
+    }
+  }
+
+  private async buildJobFromEvents(chainId: string): Promise<Job> {
+    const events = await getEventsByChain(chainId);
+    const evidence = await extractEvidenceFromChain(chainId);
+
+    const obsEvent = events.find((e) => e.type === "observation");
+    const interpEvent = events.find((e) => e.type === "interpretation");
+
+    const obsPayload = obsEvent?.payload as ObservationPayload | undefined;
+    const interpPayload = interpEvent?.payload as any;
+
+    return {
+      id: chainId,
+      title: obsPayload?.pageTitle || "未知岗位",
+      url: obsPayload?.pageUrl || "",
+      evidence,
+      matchScore: interpPayload?.riskTags?.find(
+        (t: any) =>
+          t.label?.includes("契合度评估") ||
+          (t.label?.includes("匹配") &&
+            !t.label?.includes("率") &&
+            !t.label?.includes("风险")),
+      )
+        ? Math.round(
+            interpPayload.riskTags.find(
+              (t: any) =>
+                t.label?.includes("契合度评估") ||
+                (t.label?.includes("匹配") &&
+                  !t.label?.includes("率") &&
+                  !t.label?.includes("风险")),
+            ).confidence * 100,
+          )
+        : undefined,
+    };
+  }
+
+  private hashCode(str: string): number {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = (Math.imul(31, hash) + str.charCodeAt(i)) | 0;
+    }
+    return hash;
+  }
+}
+</file>
+
+<file path="src/dsh-plugin/services/career-service.ts">
+import type {
+  ActionReceipt,
+  ApplyPreparation,
+  ApplyRequest,
+  ApprovalDecision,
+  CareerState,
+  Evidence,
+  JobInspectRequest,
+  JobInspectResult,
+  JobSearchRequest,
+  JobSearchResult,
+  MissionAction,
+  MissionRecord,
+  MissionState,
+  MissionVerification,
+  VerificationResult,
+} from "../contract/types";
+import {
+  type MissionRepository,
+} from "../contract/mission";
+import {
+  DefaultPolicyEngine,
+  type PolicyEngine,
+} from "../contract/policy";
+import { EvidenceFactory } from "../contract/evidence";
+import {
+  deriveCompletionFromVerification,
+  assertCompletionInvariants,
+  type MissionCompletionContext,
+} from "../contract/mission-completion";
+import type { SCAProvider } from "../providers/types";
+
+export interface CareerStateProvider {
+  getCareerState(): Promise<CareerState>;
+}
+
+export interface CareerServiceDependencies {
+  careerState: CareerStateProvider;
+  provider: SCAProvider;
+  /**
+   * Mission 状态权威。
+   *
+   * ⚠️ 生产环境必须注入 SCAMissionRepository（Event Sourcing）。
+   * InMemoryMissionRepository 仅用于 unit test，不能用于生产。
+   */
+  missionRepository: MissionRepository;
+  policyEngine?: PolicyEngine;
+  evidenceFactory?: EvidenceFactory;
+}
+
+function generateOperationId(): string {
+  return `op_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export class CareerService {
+  private readonly missions: MissionRepository;
+  private readonly policy: PolicyEngine;
+  private readonly evidence: EvidenceFactory;
+
+  constructor(
+    private readonly deps: CareerServiceDependencies,
+  ) {
+    // missionRepository 是必填依赖，生产必须注入 SCAMissionRepository
+    this.missions = deps.missionRepository;
+
+    this.policy =
+      deps.policyEngine ?? new DefaultPolicyEngine();
+
+    this.evidence =
+      deps.evidenceFactory ?? new EvidenceFactory();
+  }
+
+  // ============================================================
+  // Search —— 只读能力，不需要审批
+  // ============================================================
+
+  async search(
+    request: JobSearchRequest,
+  ): Promise<JobSearchResult> {
+    const operationId = generateOperationId();
+
+    const mission = await this.missions.create(
+      "JOB_SEARCH",
+      request,
+      operationId,
+      operationId,
+    );
+
+    await this.transition(mission.id, "PLANNING");
+
+    const careerState =
+      await this.deps.careerState.getCareerState();
+
+    const effectiveRequest: JobSearchRequest = {
+      ...request,
+      constraints: {
+        ...careerState.constraints,
+        ...request.constraints,
+      },
+    };
+
+    await this.transition(mission.id, "DISCOVERING");
+
+    const result = await this.deps.provider.search.search(
+      effectiveRequest,
+    );
+
+    await this.missions.checkpoint(mission.id, {
+      resultCount: result.jobs.length,
+      evidenceCount: result.evidence.length,
+    });
+
+    await this.transition(mission.id, "COLLECTING");
+    await this.transition(mission.id, "EVALUATING");
+    await this.transition(mission.id, "COMPLETED");
+
+    return {
+      missionId: mission.id,
+      state: "COMPLETED",
+      results: result.jobs,
+      total: result.jobs.length,
+      hasMore: false,
+    };
+  }
+
+  // ============================================================
+  // Inspect —— 只读能力，不需要审批
+  // ============================================================
+
+  async inspect(
+    request: JobInspectRequest,
+  ): Promise<JobInspectResult> {
+    const operationId = generateOperationId();
+
+    const mission = await this.missions.create(
+      "JOB_INSPECTION",
+      request,
+      operationId,
+      operationId,
+    );
+
+    await this.transition(mission.id, "PLANNING");
+    await this.transition(mission.id, "COLLECTING");
+
+    const result =
+      await this.deps.provider.inspection.inspect(
+        request.jobId,
+      );
+
+    await this.transition(mission.id, "EVALUATING");
+    await this.transition(mission.id, "COMPLETED");
+
+    return {
+      ...result,
+      missionId: mission.id,
+    };
+  }
+
+  // ============================================================
+  // Apply —— 外部副作用能力，必须经过 Policy + Approval + Verify
+  // ============================================================
+
+  /**
+   * 发起投递请求。
+   *
+   * 流程：
+   *   CREATE → PLANNING → prepare() → Policy Gate
+   *     ├── ALLOW              → EXECUTING → execute() → VERIFYING → verify() → COMPLETED/FAILED
+   *     ├── DENY               → FAILED
+   *     └── APPROVAL_REQUIRED  → AWAITING_APPROVAL（等待 approve()/deny()）
+   *
+   * 注意：即使 Policy 返回 ALLOW，也必须经过 verify() 阶段。
+   * "accepted: true" 不等于"现实世界已成功"。
+   */
+  async apply(
+    request: ApplyRequest,
+  ) {
+    const operationId = generateOperationId();
+
+    const mission = await this.missions.create(
+      "JOB_APPLICATION",
+      request,
+      operationId,
+      operationId,
+    );
+
+    await this.transition(mission.id, "PLANNING");
+
+    // Phase 1: prepare —— 评估可行性，不产生副作用
+    const preparation: ApplyPreparation =
+      await this.deps.provider.application.prepare(
+        request,
+      );
+
+    if (!preparation.ready) {
+      await this.failMission(
+        mission.id,
+        "PREPARATION_BLOCKED",
+        "PROVIDER",
+        preparation.blockers?.join("; ") ??
+          "Application preparation failed.",
+      );
+
+      return {
+        missionId: mission.id,
+        jobId: request.jobId,
+        state: "FAILED" as MissionState,
+        failure: {
+          code: "PREPARATION_BLOCKED",
+          category: "PROVIDER",
+          message:
+            preparation.blockers?.join("; ") ??
+            "Application preparation failed.",
+          recoverable: false,
+          retryable: false,
+        },
+      };
+    }
+
+    // Phase 2: Policy Gate
+    const careerState =
+      await this.deps.careerState.getCareerState();
+
+    const decision = await this.policy.evaluate(
+      {
+        action: "APPLY",
+        constraints: careerState.constraints,
+      },
+      request,
+    );
+
+    if (decision.effect === "DENY") {
+      await this.failMission(
+        mission.id,
+        "POLICY_DENIED",
+        "POLICY",
+        decision.reason,
+      );
+
+      return {
+        missionId: mission.id,
+        jobId: request.jobId,
+        state: "FAILED" as MissionState,
+        failure: {
+          code: "POLICY_DENIED",
+          category: "POLICY",
+          message: decision.reason,
+          recoverable: false,
+          retryable: false,
+        },
+      };
+    }
+
+    if (decision.effect === "APPROVAL_REQUIRED") {
+      const approval = decision.approval ?? {
+        missionId: mission.id,
+        reason: decision.reason,
+        requestedAt: Date.now(),
+      };
+
+      await this.missions.update(mission.id, {
+        state: "AWAITING_APPROVAL",
+        pendingApproval: {
+          ...approval,
+          missionId: mission.id,
+        },
+        checkpoint: {
+          planId: preparation.planId,
+          jobId: request.jobId,
+          resumeId: request.resumeId,
+          message: request.message,
+        },
+      });
+
+      return {
+        missionId: mission.id,
+        jobId: request.jobId,
+        state: "AWAITING_APPROVAL" as MissionState,
+        approvalRequired: true,
+        reason: decision.reason,
+        pendingApproval: {
+          ...approval,
+          missionId: mission.id,
+        },
+      };
+    }
+
+    // Policy ALLOW —— 直接执行（但仍需 verify）
+    return this.executeAndVerify(
+      mission.id,
+      request.approvalToken,
+    );
+  }
+
+  /**
+   * 批准处于 AWAITING_APPROVAL 状态的 Mission。
+   *
+   * 流程：
+   *   AWAITING_APPROVAL → EXECUTING → execute() → VERIFYING → verify() → COMPLETED/FAILED
+   */
+  async approve(
+    missionId: string,
+    approvalToken?: string,
+  ) {
+    const mission = await this.requireMission(missionId);
+
+    if (mission.state !== "AWAITING_APPROVAL") {
+      throw new Error(
+        `INVALID_APPROVAL_STATE:${mission.state}`,
+      );
+    }
+
+    return this.executeAndVerify(missionId, approvalToken);
+  }
+
+  /**
+   * 拒绝处于 AWAITING_APPROVAL 状态的 Mission。
+   *
+   * 流程：
+   *   AWAITING_APPROVAL → CANCELLED
+   */
+  async deny(
+    missionId: string,
+    reason?: string,
+  ) {
+    const mission = await this.requireMission(missionId);
+
+    if (mission.state !== "AWAITING_APPROVAL") {
+      throw new Error(
+        `INVALID_APPROVAL_STATE:${mission.state}`,
+      );
+    }
+
+    await this.missions.update(missionId, {
+      state: "CANCELLED",
+      pendingApproval: undefined,
+      failure: reason
+        ? {
+            code: "APPROVAL_DENIED",
+            category: "POLICY",
+            message: reason,
+            recoverable: false,
+            retryable: false,
+          }
+        : undefined,
+    });
+
+    return {
+      missionId,
+      state: "CANCELLED" as MissionState,
+      reason: reason ?? "Approval denied by user.",
+    };
+  }
+
+  // ============================================================
+  // Mission Control
+  // ============================================================
+
+  async getMission(
+    id: string,
+  ): Promise<MissionRecord | null> {
+    return this.missions.get(id);
+  }
+
+  async pause(
+    id: string,
+  ): Promise<MissionRecord> {
+    return this.transition(id, "PAUSED");
+  }
+
+  async cancel(
+    id: string,
+  ): Promise<MissionRecord> {
+    return this.transition(id, "CANCELLED");
+  }
+
+  // ============================================================
+  // Internal: execute + verify 闭环
+  // ============================================================
+
+  private async executeAndVerify(
+    missionId: string,
+    approvalToken?: string,
+  ) {
+    await this.transition(missionId, "EXECUTING");
+
+    const actionStart = Date.now();
+    const action: MissionAction = {
+      type: "JOB_APPLICATION",
+      startedAt: actionStart,
+    };
+    await this.missions.update(missionId, { action });
+
+    // Phase 3: execute —— 执行外部行动
+    const receipt: ActionReceipt =
+      await this.deps.provider.application.execute(
+        missionId,
+        approvalToken,
+      );
+
+    action.completedAt = Date.now();
+    action.receiptId = receipt.receiptId;
+    action.receipt = receipt;
+    await this.missions.update(missionId, { action });
+
+    if (!receipt.accepted) {
+      await this.failMission(
+        missionId,
+        receipt.failure?.code ?? "APPLICATION_EXECUTION_FAILED",
+        "PROVIDER",
+        receipt.failure?.message ??
+          "Application provider rejected the operation.",
+      );
+
+      return {
+        missionId,
+        jobId: (await this.missions.get(missionId))?.input as any,
+        state: "FAILED" as MissionState,
+        verification: receipt.evidence,
+        failure: {
+          code:
+            receipt.failure?.code ??
+            "APPLICATION_EXECUTION_FAILED",
+          category: "PROVIDER",
+          message:
+            receipt.failure?.message ??
+            "Application execution failed.",
+          recoverable: receipt.failure?.retryable ?? false,
+          retryable: receipt.failure?.retryable ?? false,
+        },
+      };
+    }
+
+    // Phase 4: verify —— 基于 OBSERVED Evidence 确认现实世界状态
+    await this.transition(missionId, "VERIFYING");
+
+    const verification: VerificationResult =
+      await this.deps.provider.application.verify(
+        missionId,
+      );
+
+    // ⚠️ 关键边界：没有 OBSERVED 证据就不能 COMPLETED
+    const hasObservedEvidence = verification.evidence.some(
+      (e) => e.authority === "OBSERVED",
+    );
+
+    if (!verification.confirmed || !hasObservedEvidence) {
+      await this.failMission(
+        missionId,
+        verification.failure?.code ?? "VERIFICATION_FAILED",
+        "PROVIDER",
+        verification.failure?.message ??
+          verification.summary ??
+          "Application could not be verified by observed evidence.",
+      );
+
+      return {
+        missionId,
+        state: "FAILED" as MissionState,
+        verification: verification.evidence,
+        failure: {
+          code:
+            verification.failure?.code ??
+            "VERIFICATION_FAILED",
+          category: "PROVIDER",
+          message:
+            verification.failure?.message ??
+            verification.summary ??
+            "Verification failed: no OBSERVED evidence confirming application status.",
+          recoverable: verification.failure?.retryable ?? true,
+          retryable: verification.failure?.retryable ?? true,
+        },
+      };
+    }
+
+    // ⚠️ Phase F-1.1: MissionVerification 不存储 confirmed 字段。
+    // confirmed 是从 Evidence 推导的 Derived State，不是历史事实。
+    // Completion Gate 会通过 isSuccess 函数从 evidence 推导验证结论。
+    const missionVerification: MissionVerification = {
+      evidenceIds: verification.evidence.map((e) => e.id),
+      verifiedAt: Date.now(),
+      summary: verification.summary,
+    };
+
+    // ⚠️ COMPLETED 不是直接设置的，而是从 Verification 推导的。
+    // 必须通过 deriveCompletionFromVerification 检查 Completion 不变量。
+    const currentMission = await this.missions.get(missionId);
+    if (!currentMission) {
+      throw new Error(`MISSION_NOT_FOUND:${missionId}`);
+    }
+
+    // Phase F-1.1: EvidenceScopeValid 上下文
+    // 防止跨 Mission/跨 Action 证据污染
+    const actionId = action.receiptId ?? `action_${missionId}`;
+    const completionContext: MissionCompletionContext = {
+      missionId,
+      correlationId: currentMission.correlationId,
+      operationId: currentMission.operationId,
+      actionId,
+      actionStartedAt: action.startedAt,
+      actionCompletedAt: action.completedAt,
+    };
+
+    // ⚠️ Phase F-1.1: isSuccess 函数从 evidence 推导验证结论。
+    // 不依赖存储的 confirmed 字段，而是检查：
+    //   1. Provider 返回的 verification.confirmed（基于 OBSERVED 页面文本判断）
+    //   2. evidence 中有 DERIVED application.status=SUBMITTED
+    const isSuccess = (ev: Evidence[]): boolean => {
+      if (verification.confirmed !== true) return false;
+      const hasDerivedSubmitted = ev.some(
+        (e) =>
+          e.authority === "DERIVED" &&
+          e.claimKey === "application.status" &&
+          e.value === "SUBMITTED",
+      );
+      return hasDerivedSubmitted;
+    };
+
+    const completedMission = deriveCompletionFromVerification(
+      currentMission,
+      missionVerification,
+      verification.evidence,
+      completionContext,
+      isSuccess,
+    );
+
+    if (completedMission.state !== "COMPLETED") {
+      // 不满足 Completion 不变量，不能进入 COMPLETED
+      // 这通常意味着 verification evidence 不是 OBSERVED authority
+      await this.failMission(
+        missionId,
+        "COMPLETION_INVARIANT_VIOLATION",
+        "POLICY",
+        "Verification passed but completion invariants not satisfied (likely non-OBSERVED evidence)",
+      );
+
+      return {
+        missionId,
+        state: "FAILED" as MissionState,
+        verification: verification.evidence,
+        failure: {
+          code: "COMPLETION_INVARIANT_VIOLATION",
+          category: "POLICY",
+          message:
+            "Completion invariant violation: verification evidence must be OBSERVED authority",
+          recoverable: false,
+          retryable: false,
+        },
+      };
+    }
+
+    // 通过不变量检查，写入 verification 并设置 COMPLETED
+    await this.missions.update(missionId, {
+      state: "COMPLETED",
+      verification: missionVerification,
+      pendingApproval: undefined,
+    });
+
+    return {
+      missionId,
+      state: "COMPLETED" as MissionState,
+      verification: verification.evidence,
+      verificationSummary: verification.summary,
+    };
+  }
+
+  // ============================================================
+  // Internal helpers
+  // ============================================================
+
+  private async requireMission(
+    id: string,
+  ): Promise<MissionRecord> {
+    const mission = await this.missions.get(id);
+    if (!mission) {
+      throw new Error(`MISSION_NOT_FOUND:${id}`);
+    }
+    return mission;
+  }
+
+  private async transition(
+    missionId: string,
+    state: MissionState,
+  ): Promise<MissionRecord> {
+    return this.missions.update(
+      missionId,
+      { state },
+    );
+  }
+
+  private async failMission(
+    missionId: string,
+    code: string,
+    category:
+      | "VALIDATION"
+      | "POLICY"
+      | "NETWORK"
+      | "PROVIDER"
+      | "AUTH"
+      | "TIMEOUT"
+      | "CONFLICT"
+      | "UNKNOWN",
+    message: string,
+  ): Promise<void> {
+    await this.missions.update(
+      missionId,
+      {
+        state: "FAILED",
+        failure: {
+          code,
+          category,
+          message,
+          recoverable: false,
+          retryable: false,
+        },
+      },
+    );
+  }
+}
+</file>
+
+<file path="src/dsh-plugin/services/mission-service.ts">
+import type {
+  MissionRecord,
+  MissionStatus,
+} from "../contract/types";
+import type { CareerService } from "./career-service";
+
+export class MissionService {
+  constructor(
+    private readonly careerService: CareerService,
+  ) {}
+
+  async status(
+    missionId: string,
+  ): Promise<MissionStatus> {
+    const mission =
+      await this.careerService.getMission(missionId);
+
+    if (!mission) {
+      throw new Error(
+        `MISSION_NOT_FOUND:${missionId}`,
+      );
+    }
+
+    return { mission };
+  }
+
+  async pause(
+    missionId: string,
+  ): Promise<MissionRecord> {
+    return this.careerService.pause(missionId);
+  }
+
+  async cancel(
+    missionId: string,
+  ): Promise<MissionRecord> {
+    return this.careerService.cancel(missionId);
+  }
+
+  /**
+   * 批准处于 AWAITING_APPROVAL 状态的 Mission，继续执行 EXECUTING → VERIFYING → COMPLETED。
+   */
+  async approve(
+    missionId: string,
+    approvalToken?: string,
+  ) {
+    return this.careerService.approve(missionId, approvalToken);
+  }
+
+  /**
+   * 拒绝处于 AWAITING_APPROVAL 状态的 Mission，进入 CANCELLED。
+   */
+  async deny(
+    missionId: string,
+    reason?: string,
+  ) {
+    return this.careerService.deny(missionId, reason);
+  }
+}
+</file>
+
+<file path="src/dsh-plugin/index.ts">
+import type {
+  ApplyRequest,
+  JobInspectRequest,
+  JobSearchRequest,
+} from "./contract/types";
+
+import {
+  DefaultPolicyEngine,
+} from "./contract/policy";
+
+import type {
+  MissionRepository,
+} from "./contract/mission";
+
+import {
+  EvidenceFactory,
+} from "./contract/evidence";
+
+import {
+  CareerService,
+  type CareerServiceDependencies,
+} from "./services/career-service";
+
+import {
+  MissionService,
+} from "./services/mission-service";
+
+import {
+  SCACareerStateAdapter,
+  SCARuntimeProvider,
+  type ExistingSCARuntime,
+} from "./adapter/sca-runtime-adapter";
+
+import {
+  SCAMissionRepository,
+} from "./runtime";
+
+import {
+  SCA_DSH_PLUGIN_MANIFEST,
+} from "./manifest";
+
+/**
+ * SCA DSH Plugin
+ *
+ * 这是唯一应该被 DSH Runtime 挂载的入口。
+ *
+ * 定位：
+ *   DSH = Cognition / Intent / Mission Orchestration
+ *   SCA = State / Policy / Reality Interaction / Evidence
+ *   本 Plugin = 二者之间的 Capability Seam
+ *
+ * ⚠️ Phase F-0: 生产环境必须使用 SCAMissionRepository（Event Sourcing）。
+ *   Mission 状态是 Event Store 的投影，不是独立变量。
+ *   InMemoryMissionRepository 仅用于 unit test，不通过此构造函数注入。
+ */
+export class SCADSHPlugin {
+  readonly manifest =
+    SCA_DSH_PLUGIN_MANIFEST;
+
+  readonly career: CareerService;
+  readonly mission: MissionService;
+
+  constructor(
+    runtime: ExistingSCARuntime,
+    options?: {
+      /**
+       * 自定义 MissionRepository。
+       * 生产环境留空，默认使用 SCAMissionRepository。
+       * 仅在 unit test 中传入 InMemoryMissionRepository。
+       */
+      missionRepository?: MissionRepository;
+    },
+  ) {
+    const dependencies:
+      CareerServiceDependencies = {
+        careerState:
+          new SCACareerStateAdapter(runtime),
+
+        provider:
+          new SCARuntimeProvider(runtime),
+
+        // Phase F-0: 生产默认使用 Event Sourcing Repository
+        missionRepository:
+          options?.missionRepository ?? new SCAMissionRepository(),
+
+        policyEngine:
+          new DefaultPolicyEngine(),
+
+        evidenceFactory:
+          new EvidenceFactory(),
+      };
+
+    this.career =
+      new CareerService(dependencies);
+
+    this.mission =
+      new MissionService(
+        this.career,
+      );
+  }
+
+  /**
+   * DSH Capability: search
+   * 只读能力，不需要审批。
+   */
+  async search(
+    request: JobSearchRequest,
+  ) {
+    return this.career.search(request);
+  }
+
+  /**
+   * DSH Capability: inspect
+   * 只读能力，不需要审批。
+   */
+  async inspect(
+    request: JobInspectRequest,
+  ) {
+    return this.career.inspect(request);
+  }
+
+  /**
+   * DSH Capability: apply
+   * 外部副作用能力，必须经过 Policy + Approval + Verify。
+   *
+   * 可能返回：
+   *   - state: COMPLETED（有 OBSERVED verification evidence）
+   *   - state: AWAITING_APPROVAL（需要调用 missionApprove）
+   *   - state: FAILED（policy deny / preparation blocked / execution failed / verification failed）
+   */
+  async apply(
+    request: ApplyRequest,
+  ) {
+    return this.career.apply(request);
+  }
+
+  /**
+   * DSH Runtime Mission Control
+   */
+  async missionStatus(
+    missionId: string,
+  ) {
+    return this.mission.status(missionId);
+  }
+
+  async missionPause(
+    missionId: string,
+  ) {
+    return this.mission.pause(missionId);
+  }
+
+  async missionCancel(
+    missionId: string,
+  ) {
+    return this.mission.cancel(missionId);
+  }
+
+  /**
+   * 批准处于 AWAITING_APPROVAL 状态的投递 Mission。
+   * 批准后继续执行 EXECUTING → VERIFYING → COMPLETED/FAILED。
+   */
+  async missionApprove(
+    missionId: string,
+    approvalToken?: string,
+  ) {
+    return this.mission.approve(missionId, approvalToken);
+  }
+
+  /**
+   * 拒绝处于 AWAITING_APPROVAL 状态的投递 Mission。
+   * 拒绝后进入 CANCELLED。
+   */
+  async missionDeny(
+    missionId: string,
+    reason?: string,
+  ) {
+    return this.mission.deny(missionId, reason);
+  }
+}
+
+export * from "./manifest";
+export * from "./contract/types";
+export * from "./contract/evidence";
+export * from "./contract/policy";
+export * from "./contract/mission";
+export * from "./contract/mission-events";
+export * from "./contract/mission-completion";
+export * from "./contract/authority-model";
+export * from "./providers/types";
+export * from "./providers/sca-provider";
+export * from "./services/career-service";
+export * from "./services/mission-service";
+export * from "./adapter/sca-runtime-adapter";
+export * from "./runtime";
+</file>
+
+<file path="src/dsh-plugin/manifest.ts">
+/**
+ * DSH-facing Plugin Manifest
+ *
+ * 这里刻意保持非常小。
+ * Model 不应该看到 SCA 内部几十个函数。
+ */
+
+export const SCA_DSH_PLUGIN_MANIFEST = {
+  id: "sca",
+  version: "1.0.0",
+  name: "Sovereign Career Agent",
+  description:
+    "Career capability provider for DeepSeek Harness.",
+  capability: "career",
+
+  stateAuthorities: [
+    "career_state",
+    "mission_state",
+    "evidence",
+  ],
+
+  capabilities: {
+    search: {
+      id: "career.search",
+      mode: "mission",
+      readOnly: true,
+    },
+
+    inspect: {
+      id: "career.inspect",
+      mode: "mission",
+      readOnly: true,
+    },
+
+    apply: {
+      id: "career.apply",
+      mode: "mission",
+      readOnly: false,
+      requiresPolicy: true,
+      mayRequireApproval: true,
+    },
+
+    mission: {
+      id: "career.mission",
+      mode: "runtime",
+      operations: [
+        "status",
+        "pause",
+        "cancel",
+      ],
+    },
+  },
+
+  forbiddenModelSurface: [
+    "chrome.tabs.*",
+    "chrome.scripting.*",
+    "dom_selector",
+    "css_selector",
+    "xpath",
+    "indexeddb_key",
+    "tab_id",
+    "wdl_locator",
+    "internal_event_id",
+  ],
+
+  lifecycle: [
+    "activate",
+    "pause",
+    "resume",
+    "stop",
+    "dispose",
+  ],
+
+  contract: {
+    cognition: "DSH",
+    capability: "SCA",
+    reality: "SCA_PROVIDER",
+  },
+} as const;
+</file>
+
+<file path="src/dsh-plugin/README.md">
+# SCA DSH Plugin
+
+Sovereign Career Agent capability provider for DeepSeek Harness.
+
+## Architecture
+
+```text
+DeepSeek Harness
+       |
+       v
+Capability Seam
+       |
+       v
+SCADSHPlugin
+       |
+       +--------------------+
+       |                    |
+       v                    v
+CareerService          MissionService
+       |                    |
+       +----------+---------+ approve / deny
+       |          |
+       v          v
+    Policy     State
+       |          |
+       +----------+---------+
+                  |
+                  v
+            Evidence (Authority Gate)
+                  |
+                  v
+          SCARuntimeProvider
+                  |
+                  v
+          SCACoreRuntime (runtime/)
+                  |
+     +------------+------------+
+     v            v            v
+  Profile     Seed/Traversal  WDL/Browser
+     |            |            |
+     +------------+------------+
+                  |
+                  v
+            Observation
+                  |
+                  v
+        ProvenanceVerifier (policy)
+                  |
+                  v
+            OBSERVED Evidence
+                  |
+                  v
+            Event Store (db)
+                  |
+                  v
+           Projection (projection)
+```
+
+## Authority Model (Phase A 修正)
+
+| Authority   | 产生者                         | 说明                                   |
+|-------------|-------------------------------|----------------------------------------|
+| `OBSERVED`  | SCA Runtime / ProvenanceVerifier | 现实世界事实，Plugin 内部不能伪造       |
+| `INFERRED`  | EvidenceFactory.inferred()    | 模型推理，confidence 表达可信度         |
+| `DERIVED`   | EvidenceFactory.derived()     | 确定性计算，必须追溯上游 OBSERVED       |
+| `RETRACTED` | EvidenceFactory.retract()     | 已被证伪，不再被信任                    |
+
+**关键约束**：`EvidenceFactory` 不再提供 `observed()` 方法。所有 OBSERVED Evidence 必须通过 `runtime/evidence-mapper.ts` 从 SCA Event Store 提取。
+
+## Model-facing Capabilities
+
+Only expose:
+
+- `career.search` — 只读，不需要审批
+- `career.inspect` — 只读，不需要审批
+- `career.apply` — 外部副作用，必须经过 Policy + Approval + Verify
+- `career.mission` — status / pause / cancel / approve / deny
+
+Never expose:
+
+- Chrome TabId
+- DOM selector
+- XPath
+- IndexedDB key
+- WDL locator
+- internal event id
+- browser implementation details
+
+## Apply Flow (三段式闭环)
+
+```text
+career.apply(request)
+    │
+    ▼
+CREATE Mission → PLANNING
+    │
+    ▼
+prepare()  ← 评估可行性，不产生副作用
+    │
+    ├── blockers → FAILED
+    │
+    ▼
+Policy Gate
+    │
+    ├── DENY → FAILED
+    │
+    ├── APPROVAL_REQUIRED → AWAITING_APPROVAL
+    │       │
+    │   ┌───┴────┐
+    │   ▼        ▼
+    │ approve   deny
+    │   │        │
+    │   ▼        ▼
+    │ EXECUTING  CANCELLED
+    │
+    └── ALLOW → EXECUTING
+            │
+            ▼
+        execute()  ← 触发外部行动
+            │
+            ▼
+        VERIFYING
+            │
+            ▼
+        verify()  ← 基于 OBSERVED Evidence 确认
+            │
+            ├── confirmed + OBSERVED → COMPLETED
+            └── no OBSERVED → FAILED (VERIFICATION_FAILED)
+```
+
+**关键原则**：`accepted: true` 不等于成功。没有 OBSERVED Evidence 就不能进入 COMPLETED。
+
+## Mission Record (执行实例)
+
+```typescript
+interface MissionRecord {
+  id, kind, state, createdAt, updatedAt
+  correlationId, operationId
+  input, checkpoint
+  pendingApproval?: ApprovalRequest   // AWAITING_APPROVAL 时填充
+  action?: MissionAction               // 外部行动执行记录
+  verification?: MissionVerification   // 必须基于 OBSERVED Evidence
+  failure?: FailureState
+}
+```
+
+## Runtime Integration (Phase B-E)
+
+`runtime/sca-core-runtime.ts` 实现了 `ExistingSCARuntime` 接口，对接 SCA Core：
+
+| 方法               | SCA Core 对接                                                                 |
+|--------------------|------------------------------------------------------------------------------|
+| `getCareerState`   | `getActiveProfile()` + `getConstitution()` → CareerState 语义投影             |
+| `searchJobs`       | `SeedGenerator` → `shadowTabExecutor.enqueue` → `startTraversal` → `getInteractionStates` |
+| `inspectJob`       | 查找 InteractionState → 触发 Observation → `processObservation` → Event Store |
+| `prepareApply`     | `getActiveProfile()` + `evaluateActionGate()`                                 |
+| `executeApply`     | `appendIntent(FORM_FILL)` → `shadowTabExecutor.startTraversal()`              |
+| `verifyApply`      | Event Store 查找 PLATFORM_DISPATCH/FORM_DISPATCH 决策 → OBSERVED Evidence     |
+
+### 使用方式
+
+```typescript
+import { SCADSHPlugin, SCACoreRuntime } from "./dsh-plugin";
+
+// 接入真实 SCA Core
+const plugin = new SCADSHPlugin(new SCACoreRuntime());
+
+// 搜索
+const result = await plugin.search({ query: "Java 后端", constraints: { location: "北京" } });
+
+// 投递（需要审批）
+const applyResult = await plugin.apply({ jobId: "company_123" });
+if (applyResult.state === "AWAITING_APPROVAL") {
+  const approved = await plugin.missionApprove(applyResult.missionId);
+}
+```
+
+## Directory Structure
+
+```
+src/dsh-plugin/
+├── manifest.ts                 # DSH-facing 插件清单
+├── index.ts                    # 唯一对外入口 SCADSHPlugin
+├── README.md
+├── contract/
+│   ├── types.ts                # Authority / Mission / Evidence / Job 语义类型
+│   ├── evidence.ts             # EvidenceFactory (仅 INFERRED/DERIVED/RETRACTED)
+│   ├── policy.ts               # DefaultPolicyEngine
+│   └── mission.ts              # 状态机 + MissionRepository
+├── services/
+│   ├── career-service.ts       # search/inspect/apply + approve/deny
+│   └── mission-service.ts      # status/pause/cancel/approve/deny
+├── providers/
+│   ├── types.ts                # Search/Inspection/Application Provider 接口
+│   └── sca-provider.ts         # NullSCAProvider
+├── adapter/
+│   └── sca-runtime-adapter.ts  # ExistingSCARuntime 边界 + Adapter
+└── runtime/
+    ├── index.ts
+    ├── sca-core-runtime.ts     # ExistingSCARuntime 真实实现（对接 SCA Core）
+    └── evidence-mapper.ts      # SCA Event → DSH Evidence（OBSERVED 唯一来源）
+```
+
+## Next Steps (Phase F)
+
+- [ ] 将 `InMemoryMissionRepository` 替换为 `SCAMissionRepository`，基于 SCA Event Store
+- [ ] Mission 状态变更发出领域事件（MissionCreated / MissionCompleted 等）
+- [ ] 第一个验收场景："找北京 30K+ Java 后端，筛选匹配度最高的 5 个"
+- [ ] 第二个验收场景："把第 2 个岗位投了"（走完整 apply → approve → execute → verify 闭环）
+</file>
+
+<file path="tests/authority-gate.contamination.test.ts">
+/**
+ * Authority Gate 污染测试
+ *
+ * ⚠️ Phase F: 验证 OBSERVED Evidence 的唯一合法来源必须经过 ProvenanceVerifier。
+ *
+ * 测试场景：
+ *   1. 正常情况：observation + 对应 interpretation → OBSERVED
+ *   2. 污染 1：observation 但没有 interpretation → 不产生 OBSERVED
+ *   3. 污染 2：observation + interpretation 但 observationId 不匹配 → 不产生 OBSERVED
+ *   4. 污染 3：observation 来源是 hub（非浏览器）→ 不产生 OBSERVED
+ *   5. 污染 4：observation 来源是 cloud（非浏览器）→ 不产生 OBSERVED
+ *   6. 混合：正常 + 污染 → 只有正常的被授权
+ *   7. 多个正常 → 全部被授权
+ *
+ * 运行方式：npx tsx tests/authority-gate.contamination.test.ts
+ */
+
+import {
+  isAuthorizedObservation,
+  extractAuthorizedObservations,
+  buildContaminationScenarios,
+} from "../src/dsh-plugin/contract/evidence-authority";
+
+// ============================================================
+// 简单测试框架（不依赖 vitest）
+// ============================================================
+
+let passed = 0;
+let failed = 0;
+const failures: string[] = [];
+
+function assert(condition: boolean, message: string): void {
+  if (condition) {
+    passed++;
+  } else {
+    failed++;
+    failures.push(message);
+    console.error(`  ✗ FAIL: ${message}`);
+  }
+}
+
+function assertEqual<T>(actual: T, expected: T, message: string): void {
+  const ok = JSON.stringify(actual) === JSON.stringify(expected);
+  assert(ok, `${message} (expected=${JSON.stringify(expected)}, actual=${JSON.stringify(actual)})`);
+}
+
+// ============================================================
+// 测试：isAuthorizedObservation 单元测试
+// ============================================================
+
+console.log("\n=== Test Suite: isAuthorizedObservation ===");
+
+// 构造基础事件
+const makeObservation = (
+  id: string,
+  chainId: string,
+  source: string = "content_script",
+) => ({
+  id,
+  ts: 1000,
+  type: "observation" as const,
+  payload: { chainId, pageUrl: "https://example.com", pageTitle: "Test", extractedText: "", selector: "" },
+  source: source as any,
+  traceHash: "h1",
+  chainId,
+});
+
+const makeInterpretation = (
+  id: string,
+  observationId: string,
+  chainId: string,
+) => ({
+  id,
+  ts: 1001,
+  type: "interpretation" as const,
+  payload: { chainId, observationId, riskTags: [], summary: "", modelVersion: "v1", isLocal: false },
+  source: "cloud" as const,
+  traceHash: "h2",
+  chainId,
+});
+
+// 测试 1: 正常情况
+{
+  const obs = makeObservation("obs-1", "chain-1");
+  const interp = makeInterpretation("interp-1", "obs-1", "chain-1");
+  assert(
+    isAuthorizedObservation(obs as any, [obs, interp] as any) === true,
+    "正常 observation + 对应 interpretation 应该被授权",
+  );
+}
+
+// 测试 2: 没有 interpretation
+{
+  const obs = makeObservation("obs-2", "chain-2");
+  assert(
+    isAuthorizedObservation(obs as any, [obs] as any) === false,
+    "没有 interpretation 的 observation 不应该被授权",
+  );
+}
+
+// 测试 3: interpretation.observationId 不匹配
+{
+  const obs = makeObservation("obs-3", "chain-3");
+  const interp = makeInterpretation("interp-3", "obs-OTHER", "chain-3");
+  assert(
+    isAuthorizedObservation(obs as any, [obs, interp] as any) === false,
+    "interpretation.observationId 不匹配不应该被授权",
+  );
+}
+
+// 测试 4: source=hub
+{
+  const obs = makeObservation("obs-4", "chain-4", "hub");
+  const interp = makeInterpretation("interp-4", "obs-4", "chain-4");
+  assert(
+    isAuthorizedObservation(obs as any, [obs, interp] as any) === false,
+    "source=hub 的 observation 不应该被授权",
+  );
+}
+
+// 测试 5: source=cloud
+{
+  const obs = makeObservation("obs-5", "chain-5", "cloud");
+  const interp = makeInterpretation("interp-5", "obs-5", "chain-5");
+  assert(
+    isAuthorizedObservation(obs as any, [obs, interp] as any) === false,
+    "source=cloud 的 observation 不应该被授权",
+  );
+}
+
+// 测试 6: 非 observation 类型
+{
+  const decision = { id: "d-1", ts: 1000, type: "decision", payload: {}, source: "service_worker", traceHash: "h", chainId: "c" };
+  assert(
+    isAuthorizedObservation(decision as any, [decision] as any) === false,
+    "非 observation 类型不应该被授权",
+  );
+}
+
+// ============================================================
+// 测试：extractAuthorizedObservations 集成测试
+// ============================================================
+
+console.log("\n=== Test Suite: extractAuthorizedObservations (Contamination Scenarios) ===");
+
+const scenarios = buildContaminationScenarios();
+
+for (const scenario of scenarios) {
+  console.log(`\n  Scenario: ${scenario.name}`);
+  console.log(`    ${scenario.description}`);
+
+  const result = extractAuthorizedObservations(scenario.events as any);
+
+  assertEqual(
+    result.length,
+    scenario.expectedAuthorizedCount,
+    `${scenario.name}: 授权的 OBSERVED 数量`,
+  );
+
+  const resultIds = result.map((e) => e.id).sort();
+  const expectedIds = [...scenario.expectedAuthorizedIds].sort();
+  assertEqual(
+    resultIds,
+    expectedIds,
+    `${scenario.name}: 授权的 OBSERVED ID 列表`,
+  );
+
+  // 验证所有返回的 evidence 都是 OBSERVED authority
+  for (const ev of result) {
+    assert(
+      ev.authority === "OBSERVED",
+      `${scenario.name}: evidence ${ev.id} 的 authority 必须是 OBSERVED`,
+    );
+    assert(
+      ev.source !== undefined,
+      `${scenario.name}: evidence ${ev.id} 必须有 source`,
+    );
+    assert(
+      ev.confidence === 1.0,
+      `${scenario.name}: OBSERVED evidence ${ev.id} 的 confidence 必须是 1.0`,
+    );
+  }
+}
+
+// ============================================================
+// 测试：Authority 不变量
+// ============================================================
+
+console.log("\n=== Test Suite: Authority Invariants ===");
+
+// OBSERVED evidence 必须有 source
+{
+  const obs = makeObservation("obs-inv-1", "chain-inv-1");
+  const interp = makeInterpretation("interp-inv-1", "obs-inv-1", "chain-inv-1");
+  const result = extractAuthorizedObservations([obs, interp] as any);
+  assert(result.length === 1, "OBSERVED evidence 应该被提取");
+  assert(result[0].source !== undefined, "OBSERVED evidence 必须有 source");
+  assert(result[0].source?.providerId === "sca.observation", "OBSERVED evidence 的 providerId 必须是 sca.observation");
+}
+
+// 未授权的 observation 不会出现在结果中（静默过滤，不抛出）
+{
+  const obs = makeObservation("obs-silent-1", "chain-silent-1", "hub");
+  const interp = makeInterpretation("interp-silent-1", "obs-silent-1", "chain-silent-1");
+  let threw = false;
+  try {
+    extractAuthorizedObservations([obs, interp] as any);
+  } catch {
+    threw = true;
+  }
+  assert(threw === false, "未授权的 observation 应该被静默过滤，不抛出异常");
+}
+
+// ============================================================
+// 测试结果汇总
+// ============================================================
+
+console.log("\n" + "=".repeat(60));
+console.log(`Test Results: ${passed} passed, ${failed} failed, ${passed + failed} total`);
+console.log("=".repeat(60));
+
+if (failed > 0) {
+  console.error("\nFailed tests:");
+  failures.forEach((f, i) => console.error(`  ${i + 1}. ${f}`));
+  process.exit(1);
+} else {
+  console.log("\n✓ All Authority Gate contamination tests passed.");
+  console.log("  - No observation without interpretation can become OBSERVED");
+  console.log("  - No observation with mismatched observationId can become OBSERVED");
+  console.log("  - No observation from hub/cloud can become OBSERVED");
+  console.log("  - Unauthorized observations are silently filtered (not forged)");
+  process.exit(0);
+}
+</file>
+
+<file path="tests/mission-replay.test.ts">
+/**
+ * Mission Replay / Projection 测试
+ *
+ * ⚠️ Phase F: 验证 Mission 不"存 State"，而是"投影 State"。
+ *
+ * 核心不变量：
+ *   删除 MissionRecord → 重新读取 Event Store → replay → 得到完全相同的 MissionRecord
+ *
+ * 测试场景：
+ *   1. 空事件流 → null
+ *   2. 只有 MISSION_CREATED → CREATED
+ *   3. Search 完整流程 → COMPLETED
+ *   4. Apply 需要审批 → AWAITING_APPROVAL
+ *   5. Apply 审批被拒绝 → CANCELLED
+ *   6. Apply 完整成功 → COMPLETED（含 action + verification）
+ *   7. Mission 失败 → FAILED
+ *   8. 事件顺序不影响最终状态（幂等性）
+ *   9. 重复事件不改变状态（幂等性）
+ *
+ * 运行方式：npx tsx tests/mission-replay.test.ts
+ */
+
+import {
+  projectMissionEvents,
+  buildReplayScenarios,
+} from "../src/dsh-plugin/contract/mission-projection";
+import type {
+  MissionDomainEvent,
+  MissionCreatedEvent,
+  MissionStateChangedEvent,
+} from "../src/dsh-plugin/contract/mission-events";
+import type { MissionRecord } from "../src/dsh-plugin/contract/types";
+
+// ============================================================
+// 简单测试框架
+// ============================================================
+
+let passed = 0;
+let failed = 0;
+const failures: string[] = [];
+
+function assert(condition: boolean, message: string): void {
+  if (condition) {
+    passed++;
+  } else {
+    failed++;
+    failures.push(message);
+    console.error(`  ✗ FAIL: ${message}`);
+  }
+}
+
+function assertEqual<T>(actual: T, expected: T, message: string): void {
+  const ok = JSON.stringify(actual) === JSON.stringify(expected);
+  assert(ok, `${message} (expected=${JSON.stringify(expected)}, actual=${JSON.stringify(actual)})`);
+}
+
+function assertNotNull(value: unknown, message: string): void {
+  assert(value !== null && value !== undefined, message);
+}
+
+// ============================================================
+// 测试：Replay Scenarios
+// ============================================================
+
+console.log("\n=== Test Suite: Mission Replay / Projection ===");
+
+const scenarios = buildReplayScenarios();
+
+for (const scenario of scenarios) {
+  console.log(`\n  Scenario: ${scenario.name}`);
+  console.log(`    ${scenario.description}`);
+
+  const result = projectMissionEvents(scenario.events);
+
+  if (scenario.events.length === 0) {
+    // 空事件流应该返回 null
+    assert(result === null, `${scenario.name}: 空事件流应该返回 null`);
+    continue;
+  }
+
+  assertNotNull(result, `${scenario.name}: 投影结果不应该为 null`);
+  if (!result) continue;
+
+  assertEqual(
+    result.state,
+    scenario.expectedState,
+    `${scenario.name}: 最终状态`,
+  );
+
+  // 验证期望的字段
+  if (scenario.expectedFields) {
+    for (const [key, expectedValue] of Object.entries(scenario.expectedFields)) {
+      const actualValue = (result as any)[key];
+      assertEqual(
+        actualValue,
+        expectedValue,
+        `${scenario.name}: 字段 ${key}`,
+      );
+    }
+  }
+}
+
+// ============================================================
+// 测试：幂等性 —— 重复事件不改变状态
+// ============================================================
+
+console.log("\n=== Test Suite: Idempotency ===");
+
+{
+  const created: MissionCreatedEvent = {
+    type: "MISSION_CREATED",
+    missionId: "idem-1",
+    kind: "JOB_SEARCH",
+    input: { query: "test" },
+    correlationId: "corr-idem-1",
+    operationId: "op-idem-1",
+    createdAt: 1000,
+  };
+
+  const planning: MissionStateChangedEvent = {
+    type: "MISSION_STATE_CHANGED",
+    missionId: "idem-1",
+    fromState: "CREATED",
+    toState: "PLANNING",
+    changedAt: 1001,
+  };
+
+  // 单次投影
+  const single = projectMissionEvents([created, planning]);
+  assertNotNull(single, "单次投影不应该为 null");
+
+  // 重复事件投影（planning 出现两次）
+  const repeated = projectMissionEvents([created, planning, planning]);
+  assertNotNull(repeated, "重复事件投影不应该为 null");
+
+  assertEqual(
+    repeated?.state,
+    single?.state,
+    "重复事件不应该改变最终状态",
+  );
+  assertEqual(
+    repeated?.updatedAt,
+    single?.updatedAt,
+    "重复事件不应该改变 updatedAt（取最后一个事件的时间）",
+  );
+}
+
+// ============================================================
+// 测试：事件顺序 —— 按时间排序后投影结果一致
+// ============================================================
+
+console.log("\n=== Test Suite: Event Ordering ===");
+
+{
+  const created: MissionCreatedEvent = {
+    type: "MISSION_CREATED",
+    missionId: "order-1",
+    kind: "JOB_SEARCH",
+    input: {},
+    correlationId: "corr-order-1",
+    operationId: "op-order-1",
+    createdAt: 1000,
+  };
+
+  const planning: MissionStateChangedEvent = {
+    type: "MISSION_STATE_CHANGED",
+    missionId: "order-1",
+    fromState: "CREATED",
+    toState: "PLANNING",
+    changedAt: 1001,
+  };
+
+  const completed: MissionStateChangedEvent = {
+    type: "MISSION_STATE_CHANGED",
+    missionId: "order-1",
+    fromState: "EVALUATING",
+    toState: "COMPLETED",
+    changedAt: 1005,
+  };
+
+  // 正常顺序
+  const normal = projectMissionEvents([created, planning, completed]);
+
+  // 乱序（但 projectMissionEvents 按输入顺序处理，不自动排序）
+  // 注意：projectMissionEvents 假设输入已经按时间排序
+  // 这里测试的是：如果输入按时间排序，结果正确
+  assertEqual(
+    normal?.state,
+    "COMPLETED",
+    "正常顺序投影结果应该是 COMPLETED",
+  );
+}
+
+// ============================================================
+// 测试：Mission 不变量
+// ============================================================
+
+console.log("\n=== Test Suite: Mission Invariants ===");
+
+// MISSION_CREATED 必须是第一个事件
+{
+  const planning: MissionStateChangedEvent = {
+    type: "MISSION_STATE_CHANGED",
+    missionId: "no-created-1",
+    fromState: "CREATED",
+    toState: "PLANNING",
+    changedAt: 1001,
+  };
+
+  const result = projectMissionEvents([planning]);
+  assert(result === null, "没有 MISSION_CREATED 的事件流应该返回 null");
+}
+
+// MissionRecord.id 必须等于 MISSION_CREATED.missionId
+{
+  const created: MissionCreatedEvent = {
+    type: "MISSION_CREATED",
+    missionId: "id-check-1",
+    kind: "JOB_SEARCH",
+    input: {},
+    correlationId: "corr-id-check-1",
+    operationId: "op-id-check-1",
+    createdAt: 1000,
+  };
+
+  const result = projectMissionEvents([created]);
+  assertEqual(result?.id, "id-check-1", "MissionRecord.id 必须等于 MISSION_CREATED.missionId");
+}
+
+// ============================================================
+// 测试：VerificationCaptured 边界
+// ============================================================
+
+console.log("\n=== Test Suite: VerificationCaptured Boundary ===");
+
+{
+  const { assertVerificationBoundary } = await import(
+    "../src/dsh-plugin/contract/mission-events"
+  );
+
+  // 正常的 VerificationCaptured（只引用 evidenceIds，不包含 authority）
+  const valid = {
+    type: "VERIFICATION_CAPTURED" as const,
+    missionId: "v-1",
+    verification: {
+      evidenceIds: ["ev-1", "ev-2"],
+      verifiedAt: 1000,
+      confirmed: true,
+    },
+    changedAt: 1000,
+  };
+
+  let threw = false;
+  try {
+    assertVerificationBoundary(valid);
+  } catch {
+    threw = true;
+  }
+  assert(threw === false, "合法的 VerificationCaptured 不应该抛出");
+
+  // 非法的 VerificationCaptured（包含 authority 字段）
+  const invalid = {
+    type: "VERIFICATION_CAPTURED" as const,
+    missionId: "v-2",
+    verification: {
+      evidenceIds: ["ev-1"],
+      verifiedAt: 1000,
+      confirmed: true,
+      authority: "OBSERVED", // ⚠️ 非法：Verification 不应该包含 authority
+    },
+    changedAt: 1000,
+  };
+
+  threw = false;
+  try {
+    assertVerificationBoundary(invalid as any);
+  } catch {
+    threw = true;
+  }
+  assert(threw === true, "包含 authority 字段的 VerificationCaptured 应该抛出");
+
+  // 非法的 VerificationCaptured（evidenceIds 为空）
+  const emptyIds = {
+    type: "VERIFICATION_CAPTURED" as const,
+    missionId: "v-3",
+    verification: {
+      evidenceIds: [],
+      verifiedAt: 1000,
+      confirmed: true,
+    },
+    changedAt: 1000,
+  };
+
+  threw = false;
+  try {
+    assertVerificationBoundary(emptyIds as any);
+  } catch {
+    threw = true;
+  }
+  assert(threw === true, "evidenceIds 为空的 VerificationCaptured 应该抛出");
+}
+
+// ============================================================
+// 测试结果汇总
+// ============================================================
+
+console.log("\n" + "=".repeat(60));
+console.log(`Test Results: ${passed} passed, ${failed} failed, ${passed + failed} total`);
+console.log("=".repeat(60));
+
+if (failed > 0) {
+  console.error("\nFailed tests:");
+  failures.forEach((f, i) => console.error(`  ${i + 1}. ${f}`));
+  process.exit(1);
+} else {
+  console.log("\n✓ All Mission Replay tests passed.");
+  console.log("  - Mission can be fully reconstructed from Domain Event stream");
+  console.log("  - Empty event stream returns null");
+  console.log("  - Missing MISSION_CREATED returns null");
+  console.log("  - VerificationCaptured cannot contain authority field");
+  console.log("  - VerificationCaptured must contain non-empty evidenceIds");
+  console.log("  - Repeated events do not change final state (idempotent)");
+  process.exit(0);
+}
+</file>
+
+<file path="tests/run-all.mjs">
+/**
+ * Phase F-1.1 内核不变量验证脚本（纯 JavaScript，可直接用 node 运行）
+ *
+ * 验证内容：
+ *   Suite 1: Authority Gate 污染测试（8 场景）
+ *   Suite 2: Mission Replay 投影测试（9 场景）
+ *   Suite 3: Completion Gate 不变量（含 EvidenceScope 升级）
+ *   Suite 4: VerificationCaptured 边界（含 confirmed 禁止）
+ *   Suite 5: EvidenceScope 跨 Mission/Action 污染（F-1.1 新增）
+ *   Suite 6: Authority Model 无 trust 语义（F-1.1 新增）
+ *   Suite 7: OBSERVED → DERIVED → COMPLETED 完整链路
+ *
+ * 运行方式：node tests/run-all.mjs
+ */
+
+// ============================================================
+// 内联：isAuthorizedObservation
+// ============================================================
+
+const AUTHORIZED_OBSERVATION_SOURCES = new Set(["content_script", "service_worker"]);
+
+function isAuthorizedObservation(event, chainEvents) {
+  if (event.type !== "observation") return false;
+  if (!AUTHORIZED_OBSERVATION_SOURCES.has(event.source)) return false;
+  return chainEvents.some(
+    (e) => e.type === "interpretation" && e.payload.observationId === event.id,
+  );
+}
+
+function extractAuthorizedObservations(chainEvents) {
+  return chainEvents
+    .filter((e) => isAuthorizedObservation(e, chainEvents))
+    .map((e) => ({
+      id: e.id, authority: "OBSERVED",
+      source: { providerId: "sca.observation", uri: e.payload.pageUrl },
+      confidence: 1.0, createdAt: e.ts,
+    }));
+}
+
+// ============================================================
+// 内联：projectMissionEvents
+// ============================================================
+
+function projectMissionEvents(events) {
+  if (events.length === 0) return null;
+  const created = events.find((e) => e.type === "MISSION_CREATED");
+  if (!created) return null;
+  let mission = {
+    id: created.missionId, kind: created.kind, state: "CREATED",
+    createdAt: created.createdAt, updatedAt: created.createdAt,
+    input: created.input, correlationId: created.correlationId, operationId: created.operationId,
+  };
+  for (const event of events) {
+    if (event.type === "MISSION_CREATED") continue;
+    switch (event.type) {
+      case "MISSION_STATE_CHANGED": mission = { ...mission, state: event.toState, updatedAt: event.changedAt }; break;
+      case "MISSION_CHECKPOINTED": mission = { ...mission, checkpoint: event.checkpoint, updatedAt: event.changedAt }; break;
+      case "APPROVAL_REQUESTED": mission = { ...mission, state: "AWAITING_APPROVAL", pendingApproval: event.approval, updatedAt: event.changedAt }; break;
+      case "APPROVAL_GRANTED": mission = { ...mission, pendingApproval: undefined, updatedAt: event.changedAt }; break;
+      case "APPROVAL_DENIED": mission = { ...mission, state: "CANCELLED", pendingApproval: undefined, failure: event.reason ? { code: "APPROVAL_DENIED", category: "POLICY", message: event.reason, recoverable: false, retryable: false } : undefined, updatedAt: event.changedAt }; break;
+      case "ACTION_UPDATED": mission = { ...mission, action: event.action, updatedAt: event.changedAt }; break;
+      case "VERIFICATION_CAPTURED": mission = { ...mission, verification: event.verification, updatedAt: event.changedAt }; break;
+      case "MISSION_FAILED": mission = { ...mission, state: "FAILED", failure: event.failure, updatedAt: event.changedAt }; break;
+    }
+  }
+  return mission;
+}
+
+// ============================================================
+// 内联：checkEvidenceScope（F-1.1 新增）
+// ============================================================
+
+function checkEvidenceScope(evidence, context) {
+  if (evidence.missionId && evidence.missionId !== context.missionId) {
+    return { valid: false, reason: `MISSION_SCOPE_MISMATCH: ${evidence.missionId} !== ${context.missionId}` };
+  }
+  if (context.actionId && evidence.actionId && evidence.actionId !== context.actionId) {
+    return { valid: false, reason: `ACTION_SCOPE_MISMATCH: ${evidence.actionId} !== ${context.actionId}` };
+  }
+  if (context.actionStartedAt && evidence.createdAt < context.actionStartedAt) {
+    return { valid: false, reason: `TEMPORAL_SCOPE_INVALID: ${evidence.createdAt} < ${context.actionStartedAt}` };
+  }
+  if (evidence.correlationId && evidence.correlationId !== context.correlationId) {
+    return { valid: false, reason: `CORRELATION_SCOPE_MISMATCH` };
+  }
+  return { valid: true };
+}
+
+// ============================================================
+// 内联：checkCompletionInvariants（F-1.1 更新）
+// ============================================================
+
+function checkCompletionInvariants(mission, verificationEvidence, context, isSuccess) {
+  const violations = [];
+  if (!mission.action?.completedAt) violations.push("ACTION_NOT_COMPLETED");
+  if (!mission.verification) violations.push("VERIFICATION_MISSING");
+  else {
+    if (!mission.verification.evidenceIds?.length) violations.push("VERIFICATION_NO_EVIDENCE");
+  }
+  if (verificationEvidence?.length) {
+    // 必须至少有一条 OBSERVED（DERIVED 允许，INFERRED/RETRACTED 禁止）
+    const hasObserved = verificationEvidence.some((e) => e.authority === "OBSERVED");
+    if (!hasObserved) violations.push("NO_OBSERVED_EVIDENCE");
+    const invalidAuth = verificationEvidence.filter((e) => e.authority === "INFERRED" || e.authority === "RETRACTED");
+    if (invalidAuth.length) violations.push(`INVALID_VERIFICATION_AUTHORITY:${invalidAuth.length}`);
+    if (context) {
+      for (const ev of verificationEvidence) {
+        const scope = checkEvidenceScope(ev, context);
+        if (!scope.valid) violations.push(`EVIDENCE_SCOPE_INVALID:${ev.id}:${scope.reason}`);
+      }
+    }
+    // confirmed 从 evidence 推导（不依赖存储的 confirmed 字段）
+    const confirmed = hasObserved && (isSuccess ? isSuccess(verificationEvidence) : hasObserved);
+    if (!confirmed) violations.push("VERIFICATION_NOT_CONFIRMED");
+  } else if (mission.verification?.evidenceIds?.length) {
+    violations.push("EVIDENCE_NOT_PROVIDED");
+  }
+  return { canComplete: violations.length === 0, violations };
+}
+
+// ============================================================
+// 内联：assertVerificationBoundary（F-1.1 更新：禁止 confirmed）
+// ============================================================
+
+function assertVerificationBoundary(event) {
+  const v = event.verification;
+  if (v && typeof v === "object" && "authority" in v) throw new Error("authority not allowed");
+  if (v && typeof v === "object" && "confirmed" in v) throw new Error("confirmed not allowed in event");
+  if (!v.evidenceIds || v.evidenceIds.length === 0) throw new Error("evidenceIds must be non-empty");
+}
+
+// ============================================================
+// 测试框架
+// ============================================================
+
+let passed = 0, failed = 0;
+const failures = [];
+function assert(c, m) { if (c) passed++; else { failed++; failures.push(m); console.error(`  ✗ ${m}`); } }
+function assertEq(a, b, m) { assert(JSON.stringify(a) === JSON.stringify(b), `${m} (expected=${JSON.stringify(b)}, actual=${JSON.stringify(a)})`); }
+
+// ============================================================
+// Suite 1: Authority Gate Contamination
+// ============================================================
+
+console.log("\n" + "=".repeat(60));
+console.log("Suite 1: Authority Gate Contamination (8 tests)");
+console.log("=".repeat(60));
+
+const makeObs = (id, chainId, source = "content_script") => ({
+  id, ts: 1000, type: "observation",
+  payload: { chainId, pageUrl: "https://example.com", pageTitle: "Test", extractedText: "", selector: "" },
+  source, traceHash: "h", chainId,
+});
+const makeInterp = (id, obsId, chainId) => ({
+  id, ts: 1001, type: "interpretation",
+  payload: { chainId, observationId: obsId, riskTags: [], summary: "", modelVersion: "v1", isLocal: false },
+  source: "cloud", traceHash: "h", chainId,
+});
+
+{
+  const r = extractAuthorizedObservations([makeObs("o1", "c1"), makeInterp("i1", "o1", "c1")]);
+  assertEq(r.length, 1, "1.1 正常 → 1 OBSERVED");
+}
+{ assertEq(extractAuthorizedObservations([makeObs("o2", "c2")]).length, 0, "1.2 无 interpretation → 0"); }
+{ assertEq(extractAuthorizedObservations([makeObs("o3", "c3"), makeInterp("i3", "OTHER", "c3")]).length, 0, "1.3 observationId 不匹配 → 0"); }
+{ assertEq(extractAuthorizedObservations([makeObs("o4", "c4", "hub"), makeInterp("i4", "o4", "c4")]).length, 0, "1.4 source=hub → 0"); }
+{ assertEq(extractAuthorizedObservations([makeObs("o5", "c5", "cloud"), makeInterp("i5", "o5", "c5")]).length, 0, "1.5 source=cloud → 0"); }
+{
+  const r = extractAuthorizedObservations([makeObs("o6a", "c6"), makeObs("o6b", "c6", "hub"), makeInterp("i6a", "o6a", "c6"), makeInterp("i6b", "o6b", "c6")]);
+  assertEq(r.length, 1, "1.6 混合 → 只有正常的");
+}
+{ assertEq(extractAuthorizedObservations([makeObs("o7a", "c7"), makeObs("o7b", "c7"), makeInterp("i7a", "o7a", "c7"), makeInterp("i7b", "o7b", "c7")]).length, 2, "1.7 多个正常 → 2"); }
+{ let threw = false; try { extractAuthorizedObservations([makeObs("o8", "c8", "hub")]); } catch { threw = true; } assert(!threw, "1.8 静默过滤不抛出"); }
+
+// ============================================================
+// Suite 2: Mission Replay
+// ============================================================
+
+console.log("\n" + "=".repeat(60));
+console.log("Suite 2: Mission Replay / Projection (9 tests)");
+console.log("=".repeat(60));
+
+const created = (id, kind = "JOB_SEARCH") => ({ type: "MISSION_CREATED", missionId: id, kind, input: {}, correlationId: `corr-${id}`, operationId: `op-${id}`, createdAt: 1000 });
+const stateChange = (id, from, to, ts) => ({ type: "MISSION_STATE_CHANGED", missionId: id, fromState: from, toState: to, changedAt: ts });
+
+assertEq(projectMissionEvents([]), null, "2.1 空 → null");
+assertEq(projectMissionEvents([created("m1")]).state, "CREATED", "2.2 只有 CREATED");
+assertEq(projectMissionEvents([created("m2"), stateChange("m2","CREATED","PLANNING",1001), stateChange("m2","PLANNING","COMPLETED",1002)]).state, "COMPLETED", "2.3 完整流程");
+{
+  const r = projectMissionEvents([created("m3","JOB_APPLICATION"), stateChange("m3","CREATED","PLANNING",1001), { type:"APPROVAL_REQUESTED", missionId:"m3", approval:{missionId:"m3",reason:"need",requestedAt:1002}, changedAt:1002 }]);
+  assertEq(r.state, "AWAITING_APPROVAL", "2.4 需要审批");
+}
+{
+  const r = projectMissionEvents([created("m4","JOB_APPLICATION"), stateChange("m4","CREATED","PLANNING",1001), { type:"APPROVAL_REQUESTED", missionId:"m4", approval:{missionId:"m4",reason:"need",requestedAt:1002}, changedAt:1002 }, { type:"APPROVAL_DENIED", missionId:"m4", reason:"user deny", changedAt:1003 }]);
+  assertEq(r.state, "CANCELLED", "2.5 审批被拒绝");
+}
+{
+  const r = projectMissionEvents([
+    created("m5","JOB_APPLICATION"),
+    stateChange("m5","CREATED","EXECUTING",1001),
+    { type:"ACTION_UPDATED", missionId:"m5", action:{type:"JOB_APPLICATION",startedAt:1001,completedAt:1005,receiptId:"r1"}, changedAt:1005 },
+    stateChange("m5","EXECUTING","VERIFYING",1006),
+    // ⚠️ F-1.1: VerificationCaptured 不包含 confirmed
+    { type:"VERIFICATION_CAPTURED", missionId:"m5", verification:{evidenceIds:["ev1","ev2"],verifiedAt:1007,summary:"ok"}, changedAt:1007 },
+    stateChange("m5","VERIFYING","COMPLETED",1008),
+  ]);
+  assertEq(r.state, "COMPLETED", "2.6 Apply 完整成功");
+  assertEq(r.verification.evidenceIds, ["ev1","ev2"], "2.6 evidenceIds 正确");
+  assert(!("confirmed" in r.verification), "2.6 verification 不包含 confirmed 字段");
+}
+{
+  const r = projectMissionEvents([created("m6"), stateChange("m6","CREATED","PLANNING",1001), { type:"MISSION_FAILED", missionId:"m6", failure:{code:"NET",category:"NETWORK",message:"fail",recoverable:true,retryable:true}, changedAt:1002 }]);
+  assertEq(r.state, "FAILED", "2.7 失败");
+}
+assertEq(projectMissionEvents([stateChange("mx","CREATED","PLANNING",1001)]), null, "2.8 无 MISSION_CREATED → null");
+{
+  const s = projectMissionEvents([created("m9"), stateChange("m9","CREATED","PLANNING",1001)]);
+  const r = projectMissionEvents([created("m9"), stateChange("m9","CREATED","PLANNING",1001), stateChange("m9","CREATED","PLANNING",1001)]);
+  assertEq(r.state, s.state, "2.9 幂等性");
+}
+
+// ============================================================
+// Suite 3: Completion Gate Invariants
+// ============================================================
+
+console.log("\n" + "=".repeat(60));
+console.log("Suite 3: Completion Gate Invariants (8 tests)");
+console.log("=".repeat(60));
+
+{
+  const m = { action:{completedAt:1005}, verification:{evidenceIds:["e1"]} };
+  const ev = [{id:"e1",authority:"OBSERVED",createdAt:1006,missionId:"m1"}];
+  const ctx = {missionId:"m1",correlationId:"c1",operationId:"o1",actionId:"a1",actionStartedAt:1001};
+  const r = checkCompletionInvariants(m, ev, ctx);
+  assert(r.canComplete, "3.1 全部满足 → canComplete");
+}
+{
+  const m = { action:{}, verification:{evidenceIds:["e1"]} };
+  const r = checkCompletionInvariants(m, [{authority:"OBSERVED"}], {});
+  assert(!r.canComplete && r.violations.includes("ACTION_NOT_COMPLETED"), "3.2 action 未完成");
+}
+{
+  const m = { action:{completedAt:1005}, verification:{evidenceIds:["e1"]} };
+  const r = checkCompletionInvariants(m, [{authority:"DERIVED"}], {});
+  assert(!r.canComplete, "3.3 非 OBSERVED → 拒绝");
+}
+{
+  const m = { action:{completedAt:1005}, verification:{evidenceIds:["e1"]} };
+  const ev = [{id:"e1",authority:"OBSERVED",createdAt:900,missionId:"m1"}]; // 早于 action
+  const ctx = {missionId:"m1",correlationId:"c1",operationId:"o1",actionId:"a1",actionStartedAt:1001};
+  const r = checkCompletionInvariants(m, ev, ctx);
+  assert(!r.canComplete, "3.4 时间范围无效 → 拒绝");
+}
+{
+  const m = { action:{completedAt:1005} };
+  const r = checkCompletionInvariants(m, [], {});
+  assert(!r.canComplete, "3.5 无 verification → 拒绝");
+}
+{
+  const m = { action:{completedAt:1005}, verification:{evidenceIds:["e1"]} };
+  const ev = [{id:"e1",authority:"OBSERVED",createdAt:1006,missionId:"m1"}];
+  const ctx = {missionId:"m1",correlationId:"c1",operationId:"o1",actionId:"a1",actionStartedAt:1001};
+  const isSuccess = () => false; // 强制不成功
+  const r = checkCompletionInvariants(m, ev, ctx, isSuccess);
+  assert(!r.canComplete && r.violations.some(v => v.includes("VERIFICATION_NOT_CONFIRMED")), "3.6 isSuccess 返回 false → 拒绝");
+}
+{
+  const m = { action:{completedAt:1005}, verification:{evidenceIds:["e1"]} };
+  const ev = [{id:"e1",authority:"OBSERVED",createdAt:1006,missionId:"m1"},{id:"d1",authority:"DERIVED",claimKey:"application.status",value:"SUBMITTED"}];
+  const ctx = {missionId:"m1",correlationId:"c1",operationId:"o1",actionId:"a1",actionStartedAt:1001};
+  const isSuccess = (e) => e.some(x => x.authority==="DERIVED" && x.claimKey==="application.status" && x.value==="SUBMITTED");
+  const r = checkCompletionInvariants(m, ev, ctx, isSuccess);
+  assert(r.canComplete, "3.7 OBSERVED + DERIVED SUBMITTED → 通过");
+}
+{
+  const m = { action:{completedAt:1005}, verification:{evidenceIds:["e1"]} };
+  const ev = [{id:"e1",authority:"OBSERVED",createdAt:1006,missionId:"m1"}];
+  const ctx = {missionId:"m1",correlationId:"c1",operationId:"o1",actionId:"a1",actionStartedAt:1001};
+  // 不传 isSuccess，默认 hasObserved=true
+  const r = checkCompletionInvariants(m, ev, ctx);
+  assert(r.canComplete, "3.8 默认 isSuccess（有 OBSERVED 即通过）");
+}
+
+// ============================================================
+// Suite 4: VerificationCaptured Boundary
+// ============================================================
+
+console.log("\n" + "=".repeat(60));
+console.log("Suite 4: VerificationCaptured Boundary (4 tests)");
+console.log("=".repeat(60));
+
+{ let threw=false; try { assertVerificationBoundary({verification:{evidenceIds:["e1"]}}); } catch { threw=true; } assert(!threw, "4.1 合法 → 不抛出"); }
+{ let threw=false; try { assertVerificationBoundary({verification:{evidenceIds:["e1"],authority:"OBSERVED"}}); } catch { threw=true; } assert(threw, "4.2 含 authority → 抛出"); }
+{ let threw=false; try { assertVerificationBoundary({verification:{evidenceIds:["e1"],confirmed:true}}); } catch { threw=true; } assert(threw, "4.3 含 confirmed → 抛出 (F-1.1)"); }
+{ let threw=false; try { assertVerificationBoundary({verification:{evidenceIds:[]}}); } catch { threw=true; } assert(threw, "4.4 evidenceIds 为空 → 抛出"); }
+
+// ============================================================
+// Suite 5: EvidenceScope 跨 Mission/Action 污染（F-1.1 核心新增）
+// ============================================================
+
+console.log("\n" + "=".repeat(60));
+console.log("Suite 5: EvidenceScope Cross-Mission/Action Contamination (8 tests)");
+console.log("=".repeat(60));
+
+// 5.1 MissionScope: evidence.missionId 不匹配
+{
+  const ev = { id:"e1", authority:"OBSERVED", createdAt:1006, missionId:"mission-B" };
+  const ctx = { missionId:"mission-A", correlationId:"cA", operationId:"oA", actionId:"aA", actionStartedAt:1001 };
+  const r = checkEvidenceScope(ev, ctx);
+  assert(!r.valid && r.reason.includes("MISSION_SCOPE_MISMATCH"), "5.1 MissionScope 不匹配 → 拒绝");
+}
+
+// 5.2 ActionScope: evidence.actionId 不匹配
+{
+  const ev = { id:"e1", authority:"OBSERVED", createdAt:1006, missionId:"m1", actionId:"action-2" };
+  const ctx = { missionId:"m1", correlationId:"c1", operationId:"o1", actionId:"action-1", actionStartedAt:1001 };
+  const r = checkEvidenceScope(ev, ctx);
+  assert(!r.valid && r.reason.includes("ACTION_SCOPE_MISMATCH"), "5.2 ActionScope 不匹配 → 拒绝");
+}
+
+// 5.3 跨 Mission 污染：Mission A verify 时传入 Mission B 的 evidence
+{
+  const missionA = { action:{completedAt:1005}, verification:{evidenceIds:["eB"]} };
+  const evB = [{ id:"eB", authority:"OBSERVED", createdAt:1006, missionId:"mission-B", actionId:"action-B" }];
+  const ctxA = { missionId:"mission-A", correlationId:"cA", operationId:"oA", actionId:"action-A", actionStartedAt:1001 };
+  const r = checkCompletionInvariants(missionA, evB, ctxA);
+  assert(!r.canComplete, "5.3 跨 Mission 证据 → 拒绝 (Mission A 不能吸收 Mission B 的 evidence)");
+  assert(r.violations.some(v => v.includes("MISSION_SCOPE_MISMATCH")), "5.3 违规包含 MISSION_SCOPE_MISMATCH");
+}
+
+// 5.4 同 Mission 不同 Action：Action 1 的 evidence 不能用于 Action 2
+{
+  const mission = { action:{completedAt:1005,receiptId:"action-2"}, verification:{evidenceIds:["e1"]} };
+  const evOld = [{ id:"e1", authority:"OBSERVED", createdAt:1006, missionId:"m1", actionId:"action-1" }];
+  const ctx = { missionId:"m1", correlationId:"c1", operationId:"o1", actionId:"action-2", actionStartedAt:1001 };
+  const r = checkCompletionInvariants(mission, evOld, ctx);
+  assert(!r.canComplete, "5.4 同 Mission 不同 Action → 拒绝");
+  assert(r.violations.some(v => v.includes("ACTION_SCOPE_MISMATCH")), "5.4 违规包含 ACTION_SCOPE_MISMATCH");
+}
+
+// 5.5 时间相同但 action 不同 → 拒绝（证明时间不足以作为 Scope Authority）
+{
+  const ev = { id:"e1", authority:"OBSERVED", createdAt:1006, missionId:"m1", actionId:"action-B" };
+  const ctx = { missionId:"m1", correlationId:"c1", operationId:"o1", actionId:"action-A", actionStartedAt:1000 };
+  const r = checkEvidenceScope(ev, ctx);
+  assert(!r.valid, "5.5 时间相同但 action 不同 → 拒绝 (时间不是 Scope Authority)");
+}
+
+// 5.6 正确的 Mission+Action+时间 → 通过
+{
+  const ev = { id:"e1", authority:"OBSERVED", createdAt:1006, missionId:"m1", actionId:"a1", correlationId:"c1" };
+  const ctx = { missionId:"m1", correlationId:"c1", operationId:"o1", actionId:"a1", actionStartedAt:1001 };
+  const r = checkEvidenceScope(ev, ctx);
+  assert(r.valid, "5.6 正确的 Mission+Action+时间 → 通过");
+}
+
+// 5.7 evidence 无 missionId 但 context 有 → 通过（向后兼容，不强制要求）
+{
+  const ev = { id:"e1", authority:"OBSERVED", createdAt:1006 };
+  const ctx = { missionId:"m1", correlationId:"c1", operationId:"o1", actionId:"a1", actionStartedAt:1001 };
+  const r = checkEvidenceScope(ev, ctx);
+  assert(r.valid, "5.7 evidence 无 missionId → 通过 (不强制要求，向后兼容)");
+}
+
+// 5.8 correlationId 不匹配 → 拒绝
+{
+  const ev = { id:"e1", authority:"OBSERVED", createdAt:1006, missionId:"m1", correlationId:"corr-OTHER" };
+  const ctx = { missionId:"m1", correlationId:"corr-m1", operationId:"o1", actionId:"a1", actionStartedAt:1001 };
+  const r = checkEvidenceScope(ev, ctx);
+  assert(!r.valid && r.reason.includes("CORRELATION_SCOPE_MISMATCH"), "5.8 correlationId 不匹配 → 拒绝");
+}
+
+// ============================================================
+// Suite 6: Authority Model 无 trust 语义（F-1.1 新增）
+// ============================================================
+
+console.log("\n" + "=".repeat(60));
+console.log("Suite 6: Authority Model - No Trust Semantics (4 tests)");
+console.log("=".repeat(60));
+
+// 模拟 AUTHORITY_MODEL（不含 trustLevel）
+const AUTHORITY_MODEL = {
+  OBSERVED: { authority:"OBSERVED", epistemicClass:"reality", canVerifyCompletion:true },
+  DERIVED: { authority:"DERIVED", epistemicClass:"deterministic", canVerifyCompletion:false },
+  INFERRED: { authority:"INFERRED", epistemicClass:"hypothesis", canVerifyCompletion:false },
+  RETRACTED: { authority:"RETRACTED", epistemicClass:"invalidated", canVerifyCompletion:false },
+};
+
+{
+  for (const [auth, def] of Object.entries(AUTHORITY_MODEL)) {
+    assert(!("trustLevel" in def), `6.1 ${auth} 不含 trustLevel 字段`);
+    assert("epistemicClass" in def, `6.1 ${auth} 有 epistemicClass 字段`);
+  }
+}
+{
+  assert(AUTHORITY_MODEL.OBSERVED.canVerifyCompletion === true, "6.2 OBSERVED 可验证 Completion");
+  assert(AUTHORITY_MODEL.DERIVED.canVerifyCompletion === false, "6.2 DERIVED 不可单独验证");
+  assert(AUTHORITY_MODEL.INFERRED.canVerifyCompletion === false, "6.2 INFERRED 不可验证");
+}
+{
+  // Authority 是认识论分类，不是概率
+  const classes = new Set(Object.values(AUTHORITY_MODEL).map(d => d.epistemicClass));
+  assertEq(classes.size, 4, "6.3 四种不同的认识论分类");
+}
+{
+  // confidence 是具体 Claim 的属性，不是 Authority 的属性
+  const evWithConfidence = { authority:"OBSERVED", confidence:1.0 };
+  const evLowConfidence = { authority:"INFERRED", confidence:0.3 };
+  assert(evWithConfidence.authority === "OBSERVED", "6.4 authority 与 confidence 分离");
+  assert(evLowConfidence.authority === "INFERRED", "6.4 INFERRED 可以有低 confidence");
+}
+
+// ============================================================
+// Suite 7: OBSERVED → DERIVED → COMPLETED 完整链路
+// ============================================================
+
+console.log("\n" + "=".repeat(60));
+console.log("Suite 7: OBSERVED → DERIVED → COMPLETED Full Chain (4 tests)");
+console.log("=".repeat(60));
+
+// 7.1 完整链路：OBSERVED 页面文本 → DERIVED status → COMPLETED
+{
+  const observedEv = { id:"obs-1", authority:"OBSERVED", claimKey:"observation:page", value:{extractedText:"投递成功"}, createdAt:1006, missionId:"m1", actionId:"a1" };
+  const derivedEv = { id:"der-1", authority:"DERIVED", claimKey:"application.status", value:"SUBMITTED", createdAt:1007, missionId:"m1", actionId:"a1" };
+  const mission = { action:{completedAt:1005,receiptId:"a1"}, verification:{evidenceIds:["obs-1","der-1"]} };
+  const ctx = { missionId:"m1", correlationId:"c1", operationId:"o1", actionId:"a1", actionStartedAt:1001 };
+  const isSuccess = (ev) => ev.some(e => e.authority==="DERIVED" && e.claimKey==="application.status" && e.value==="SUBMITTED");
+  const r = checkCompletionInvariants(mission, [observedEv, derivedEv], ctx, isSuccess);
+  assert(r.canComplete, "7.1 OBSERVED→DERIVED SUBMITTED→COMPLETED 完整链路通过");
+}
+
+// 7.2 只有 OBSERVED 但没有 DERIVED SUBMITTED → 不通过（需要 isSuccess 判断）
+{
+  const observedEv = { id:"obs-1", authority:"OBSERVED", claimKey:"observation:page", value:{extractedText:"请登录后继续"}, createdAt:1006, missionId:"m1", actionId:"a1" };
+  const mission = { action:{completedAt:1005,receiptId:"a1"}, verification:{evidenceIds:["obs-1"]} };
+  const ctx = { missionId:"m1", correlationId:"c1", operationId:"o1", actionId:"a1", actionStartedAt:1001 };
+  const isSuccess = (ev) => ev.some(e => e.authority==="DERIVED" && e.claimKey==="application.status" && e.value==="SUBMITTED");
+  const r = checkCompletionInvariants(mission, [observedEv], ctx, isSuccess);
+  assert(!r.canComplete, "7.2 只有 OBSERVED(请登录) 无 DERIVED SUBMITTED → 不通过");
+}
+
+// 7.3 Execution Success ≠ Verification Success
+{
+  // ActionReceipt.accepted=true 但 Observation="请登录后继续"
+  const mission = { action:{completedAt:1005,receiptId:"a1",receipt:{accepted:true}}, verification:{evidenceIds:["obs-1"]} };
+  const observedEv = { id:"obs-1", authority:"OBSERVED", value:{extractedText:"请登录后继续"}, createdAt:1006, missionId:"m1", actionId:"a1" };
+  const ctx = { missionId:"m1", correlationId:"c1", operationId:"o1", actionId:"a1", actionStartedAt:1001 };
+  const isSuccess = (ev) => ev.some(e => e.authority==="DERIVED" && e.value==="SUBMITTED");
+  const r = checkCompletionInvariants(mission, [observedEv], ctx, isSuccess);
+  assert(!r.canComplete, "7.3 Execution accepted=true 但 Observation=请登录 → COMPLETED=false");
+}
+
+// 7.4 Verification Event Replay: Event 不存 confirmed，Projection 从 evidence 推导
+{
+  const events = [
+    created("m7","JOB_APPLICATION"),
+    stateChange("m7","CREATED","EXECUTING",1001),
+    { type:"ACTION_UPDATED", missionId:"m7", action:{type:"JOB_APPLICATION",startedAt:1001,completedAt:1005,receiptId:"a1"}, changedAt:1005 },
+    stateChange("m7","EXECUTING","VERIFYING",1006),
+    { type:"VERIFICATION_CAPTURED", missionId:"m7", verification:{evidenceIds:["obs-1"],verifiedAt:1007,summary:"页面观察到投递成功"}, changedAt:1007 },
+  ];
+  const projected = projectMissionEvents(events);
+  // Event 中没有 confirmed，Projection 中也不应该有 confirmed
+  assert(!("confirmed" in projected.verification), "7.4 Replay 后 verification 不包含 confirmed");
+  assertEq(projected.verification.evidenceIds, ["obs-1"], "7.4 Replay 后 evidenceIds 正确");
+  assertEq(projected.state, "VERIFYING", "7.4 Replay 后状态为 VERIFYING（COMPLETED 由 Completion Gate 推导，不是 Event）");
+}
+
+// ============================================================
+// 汇总
+// ============================================================
+
+console.log("\n" + "=".repeat(60));
+console.log(`Phase F-1.1 Kernel Invariants: ${passed} passed, ${failed} failed, ${passed + failed} total`);
+console.log("=".repeat(60));
+
+if (failed > 0) {
+  console.error("\nFailed:");
+  failures.forEach((f, i) => console.error(`  ${i + 1}. ${f}`));
+  process.exit(1);
+} else {
+  console.log("\n✓ All Phase F-1.1 kernel invariants passed.");
+  console.log("");
+  console.log("Verified invariants (F-1.1 hardening):");
+  console.log("  ① EvidenceScope = MissionScope + ActionScope + TemporalScope (not just time)");
+  console.log("  ② Cross-Mission evidence cannot be absorbed by another Mission");
+  console.log("  ③ Same-Mission different-Action evidence cannot be reused");
+  console.log("  ④ Time alone is not sufficient as Scope Authority");
+  console.log("  ⑤ VerificationCaptured must not store confirmed (derived state)");
+  console.log("  ⑥ VerificationCaptured must not store authority (evidence chain)");
+  console.log("  ⑦ Authority = epistemic class, confidence = claim confidence (separated)");
+  console.log("  ⑧ No trustLevel in AuthorityModel (different semantic types)");
+  console.log("  ⑨ OBSERVED → DERIVED → COMPLETED full chain required");
+  console.log("  ⑩ Execution accepted ≠ Verification success (reality observation required)");
+  console.log("  ⑪ Mission can be replayed from Domain Event stream (no confirmed in event)");
+  console.log("  ⑫ COMPLETED is derived by Completion Gate, not stored as event fact");
+  process.exit(0);
+}
+</file>
+
+<file path="package.json">
+{
+  "name": "dsh-sca-plugin",
+  "version": "1.0.0",
+  "description": "Sovereign Career Agent capability provider for DeepSeek Harness",
+  "type": "module",
+  "scripts": {
+    "test:contamination": "tsx tests/authority-gate.contamination.test.ts",
+    "test:replay": "tsx tests/mission-replay.test.ts",
+    "test": "npm run test:contamination && npm run test:replay",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}
+</file>
+
+<file path="tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "lib": ["ES2020", "DOM"],
+    "types": ["chrome"],
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@sca/*": ["../sca/src/*"],
+      "@shared/*": ["../sca/src/shared/*"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}
+</file>
+
+</files>

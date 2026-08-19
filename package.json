@@ -1,0 +1,16 @@
+{
+  "name": "dsh-sca-plugin",
+  "version": "1.0.0",
+  "description": "Sovereign Career Agent capability provider for DeepSeek Harness",
+  "type": "module",
+  "scripts": {
+    "test:contamination": "tsx tests/authority-gate.contamination.test.ts",
+    "test:replay": "tsx tests/mission-replay.test.ts",
+    "test": "npm run test:contamination && npm run test:replay",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}
