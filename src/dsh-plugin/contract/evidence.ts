@@ -47,23 +47,41 @@ export class EvidenceFactory {
 
   /**
    * 确定性计算产生的证据。例如匹配度评分、聚合统计。
-   * 必须在 derivedFromEvidenceIds 中追溯到上游 OBSERVED。
+   *
+   * ⚠️ P1-3 Fix: DERIVED Evidence MUST trace back to upstream OBSERVED/DERIVED.
+   * The derivedFromEvidenceIds field is now REQUIRED for DERIVED authority.
+   *
+   * @param derivedFromEvidenceIds Upstream Evidence IDs that this DERIVED evidence is based on.
+   *   Must be non-empty and reference valid OBSERVED or DERIVED Evidence.
    */
   derived<T>(
     claimKey: string,
     value: T,
-    options?: {
+    options: {
       confidence?: number;
       source?: EvidenceSource;
+      derivedFromEvidenceIds: string[]; // ⚠️ P1-3: REQUIRED for DERIVED
     },
   ): Evidence<T> {
-    return this.create(
+    if (!options.derivedFromEvidenceIds || options.derivedFromEvidenceIds.length === 0) {
+      throw new Error(
+        "DERIVED_EVIDENCE_REQUIRES_PROVENANCE: derivedFromEvidenceIds must be non-empty. " +
+          "DERIVED Evidence must trace back to upstream OBSERVED/DERIVED Evidence.",
+      );
+    }
+
+    const evidence = this.create(
       claimKey,
       value,
       "DERIVED",
-      options?.source,
-      options?.confidence,
+      options.source,
+      options.confidence,
     );
+
+    return {
+      ...evidence,
+      derivedFromEvidenceIds: options.derivedFromEvidenceIds,
+    };
   }
 
   /**

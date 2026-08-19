@@ -219,17 +219,19 @@ export async function extractJobMatchFromChain(
 }
 
 // ============================================================
-// 向后兼容导出（已废弃，仅保留引用）
+// ⚠️ P1-2 Fix: mapObservationToEvidence REMOVED.
+//
+// Previously, this function allowed callers to bypass the Authority Gate
+// by directly mapping any observation event to Evidence without checking
+// isAuthorizedObservation().
+//
+// The only legitimate way to get OBSERVED Evidence is through:
+//   extractAuthorizedObservations(events) → filters via isAuthorizedObservation()
+//
+// If you need to map a single authorized observation, use:
+//   mapAuthorizedObservationToEvidence(event) — but ONLY after verifying
+//   isAuthorizedObservation(event, chainEvents) returns true.
+//
+// No backward-compatibility export is provided. Any code using this function
+// must be updated to use extractAuthorizedObservations() instead.
 // ============================================================
-
-/**
- * @deprecated 已废弃。使用 extractAuthorizedObservations() 替代。
- * 此函数不做 ProvenanceVerifier 校验，仅保留用于内部测试。
- */
-export function mapObservationToEvidence(
-  event: SovereigntyEvent,
-): Evidence {
-  // 注意：此函数不做授权校验，调用方必须自行确保 event 已通过 isAuthorizedObservation()。
-  // 推荐使用 extractAuthorizedObservations()。
-  return mapAuthorizedObservationToEvidence(event);
-}

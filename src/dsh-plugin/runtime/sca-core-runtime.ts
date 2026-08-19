@@ -416,6 +416,9 @@ export class SCACoreRuntime implements ExistingSCARuntime {
   /**
    * executeApply —— 执行外部行动（触发投递）。
    *
+   * ⚠️ P0-4 Fix: jobId is now read from mission checkpoint, not equal to missionId.
+   * Mission.id = 意图身份, Job.entityId = 现实实体身份.
+   *
    * 通过 appendIntent 写入 FORM_FILL 类型的 intent 事件，
    * shadowTabExecutor 的 outbox 处理器会消费并执行。
    *
@@ -426,9 +429,35 @@ export class SCACoreRuntime implements ExistingSCARuntime {
     approvalToken?: string,
     _signal?: AbortSignal,
   ): Promise<ActionReceipt> {
-    // 从 mission checkpoint 中恢复 jobId（简化实现：直接用 missionId 关联）
-    // 在实际实现中，jobId 应该在 prepare 阶段存入 checkpoint
-    const jobId = missionId; // 简化：实际应从 checkpoint 读取
+    // ⚠️ P0-4 Fix: Read jobId from mission checkpoint (set during prepare phase).
+    // Previously: jobId = missionId (WRONG - mixed intent identity with entity identity)
+    // Now: jobId comes from checkpoint.jobId set by CareerService during apply()
+    const db = await getDb();
+    const tx = db.transaction("events", "readonly");
+    const events = await tx.store.index("by_chain").getAll(`dsh_mission_${missionId}`);
+    await tx.done;
+
+    let jobId: string | undefined;
+    for (const event of events) {
+      const payload = event.payload as any;
+      if (payload.note === "MISSION_CHECKPOINTED" && payload.checkpoint?.jobId) {
+        jobId = payload.checkpoint.jobId;
+        break;
+      }
+    }
+
+    if (!jobId) {
+      return {
+        missionId,
+        accepted: false,
+        evidence: [],
+        failure: {
+          code: "JOB_ID_NOT_FOUND",
+          message: "JobId not found in mission checkpoint. This indicates a bug in the apply flow.",
+          retryable: false,
+        },
+      };
+    }
 
     try {
       // 写入投递 intent，触发 SCA 的 outbox 处理
@@ -438,6 +467,7 @@ export class SCACoreRuntime implements ExistingSCARuntime {
         taskType: "JOB",
         metadata: {
           missionId,
+          jobId,
           approvalToken: approvalToken || "user_approved",
           source: "dsh_plugin",
         },
@@ -474,6 +504,8 @@ export class SCACoreRuntime implements ExistingSCARuntime {
   /**
    * verifyApply —— 基于已授权 OBSERVED Evidence 确认现实世界状态。
    *
+   * ⚠️ P0-4 Fix: jobId is now read from mission checkpoint, not equal to missionId.
+   *
    * ⚠️ Authority Gate（Phase E.5 修正）：
    *   不能用 FORM_DISPATCH / PLATFORM_DISPATCH 等 decision event 判断 confirmed。
    *   decision event 只证明"SCA 决定执行投递"，不证明"现实世界投递成功"。
@@ -492,7 +524,34 @@ export class SCACoreRuntime implements ExistingSCARuntime {
     missionId: string,
     signal?: AbortSignal,
   ): Promise<VerificationResult> {
-    const jobId = missionId; // 简化：实际应从 checkpoint 读取
+    // ⚠️ P0-4 Fix: Read jobId from mission checkpoint (same as executeApply).
+    const db = await getDb();
+    const tx = db.transaction("events", "readonly");
+    const events = await tx.store.index("by_chain").getAll(`dsh_mission_${missionId}`);
+    await tx.done;
+
+    let jobId: string | undefined;
+    for (const event of events) {
+      const payload = event.payload as any;
+      if (payload.note === "MISSION_CHECKPOINTED" && payload.checkpoint?.jobId) {
+        jobId = payload.checkpoint.jobId;
+        break;
+      }
+    }
+
+    if (!jobId) {
+      return {
+        missionId,
+        confirmed: false,
+        evidence: [],
+        summary: "VERIFICATION_FAILED: jobId not found in mission checkpoint",
+        failure: {
+          code: "JOB_ID_NOT_FOUND",
+          message: "Cannot verify without jobId from mission checkpoint.",
+          retryable: false,
+        },
+      };
+    }
 
     // 等待 observation 进入 Event Store（轮询，最多 30 秒）
     // 注意：不等待 outbox 清空，因为 outbox 清空只表示"意图已消费"，不表示"结果已观察"
@@ -527,13 +586,15 @@ export class SCACoreRuntime implements ExistingSCARuntime {
       };
     }
 
-    // ⚠️ Phase F-1.1: 给所有 verification evidence 打上 missionId 作用域标记
-    // 防止跨 Mission 证据污染（EvidenceScopeValid 检查）
-    const scopedEvidence = authorizedEvidence.map((e) => ({
-      ...e,
-      missionId,
-      correlationId: missionId, // 简化：实际应使用 mission.correlationId
-    }));
+    // ⚠️ P0-3 Fix: Plugin CANNOT assign scope to Evidence.
+    // Scope must be established by SCA Reality → Observation → Evidence Mapper pipeline.
+    // Plugin only VERIFIES scope, it does not GRANT scope.
+    //
+    // If evidence lacks missionId/actionId/correlationId, it will fail
+    // checkEvidenceScope() in the Completion Gate (P0-2 fix).
+    // This prevents "historical evidence pollution" where Mission B
+    // could absorb Mission A's evidence by patching missionId here.
+    const scopedEvidence = authorizedEvidence; // No scope patching allowed
 
     // 检查 OBSERVED Evidence 内容是否表明投递成功
     // 这是 confirmed 的唯一合法依据
@@ -559,6 +620,9 @@ export class SCACoreRuntime implements ExistingSCARuntime {
       //   OBSERVED: page.text = "投递成功"  （现实事实）
       //   DERIVED:  application.status = SUBMITTED  （从 OBSERVED 确定性推导）
       //
+      // ⚠️ P1-3 Fix: DERIVED Evidence MUST include derivedFromEvidenceIds.
+      // This creates a provenance chain: OBSERVED → DERIVED.
+      //
       // confirmed = true 是 DERIVED 结论，不是 OBSERVED 事实本身。
       const actionId = `action_${missionId}`;
       const derivedEvidence: Evidence = {
@@ -568,13 +632,15 @@ export class SCACoreRuntime implements ExistingSCARuntime {
         authority: "DERIVED",
         missionId,
         actionId,
-        correlationId: missionId,
+        correlationId: missionId, // Note: this is still using missionId as correlationId (simplified)
         source: {
           providerId: "sca.verification",
           observedAt: Date.now(),
         },
         confidence: 0.95,
         createdAt: Date.now(),
+        // ⚠️ P1-3: Provenance chain — DERIVED traces back to OBSERVED
+        derivedFromEvidenceIds: [successEvidence.id],
       };
 
       return {

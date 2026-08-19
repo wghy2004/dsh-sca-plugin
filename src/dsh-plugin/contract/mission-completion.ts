@@ -56,7 +56,13 @@ export interface MissionCompletionContext {
 /**
  * 验证 Evidence 是否属于当前 Mission/Action。
  *
- * ⚠️ Phase F-1.1: EvidenceScopeValid = MissionScope ∧ ActionScope ∧ TemporalScope ∧ ClaimScope
+ * ⚠️ P0-2 Fix: EvidenceScopeValid = MissionScope ∧ ActionScope ∧ TemporalScope ∧ ClaimScope
+ *
+ * ⚠️ CRITICAL CHANGE: Missing missionId/actionId/correlationId is now REJECTED.
+ * Previously, missing fields were treated as "pass" (only mismatch was rejected).
+ * This allowed evidence without scope to pollute completion verification.
+ *
+ * Scope 不存在 = Scope 无法证明 = 拒绝
  *
  * 仅靠 createdAt >= actionStartedAt 不足以防止：
  *   Mission A (10:00 start) ← Mission B (10:02 observation) 错误吸收
@@ -71,35 +77,57 @@ export function checkEvidenceScope(
   evidence: Evidence,
   context: MissionCompletionContext,
 ): { valid: boolean; reason?: string } {
-  // 1. MissionScope: evidence.missionId 必须等于当前 mission.id
-  if (evidence.missionId && evidence.missionId !== context.missionId) {
+  // ⚠️ P0-2 Fix: Missing scope fields are now REJECTED (not just mismatched ones).
+
+  // 1. MissionScope: evidence.missionId MUST exist and equal context.missionId
+  if (!evidence.missionId) {
+    return {
+      valid: false,
+      reason: `MISSION_SCOPE_MISSING: evidence.missionId is undefined/null. Evidence cannot be used for completion without explicit mission association.`,
+    };
+  }
+  if (evidence.missionId !== context.missionId) {
     return {
       valid: false,
       reason: `MISSION_SCOPE_MISMATCH: evidence.missionId=${evidence.missionId} !== context.missionId=${context.missionId}`,
     };
   }
 
-  // 2. ActionScope: evidence.actionId 必须等于当前 action.id（如果 action 存在）
-  if (context.actionId && evidence.actionId && evidence.actionId !== context.actionId) {
+  // 2. ActionScope: evidence.actionId MUST exist and equal context.actionId (if action exists)
+  if (context.actionId) {
+    if (!evidence.actionId) {
+      return {
+        valid: false,
+        reason: `ACTION_SCOPE_MISSING: evidence.actionId is undefined/null but context.actionId=${context.actionId}. Evidence cannot be used for completion without explicit action association.`,
+      };
+    }
+    if (evidence.actionId !== context.actionId) {
+      return {
+        valid: false,
+        reason: `ACTION_SCOPE_MISMATCH: evidence.actionId=${evidence.actionId} !== context.actionId=${context.actionId}`,
+      };
+    }
+  }
+
+  // 3. CorrelationScope: evidence.correlationId MUST exist and match
+  if (!evidence.correlationId) {
     return {
       valid: false,
-      reason: `ACTION_SCOPE_MISMATCH: evidence.actionId=${evidence.actionId} !== context.actionId=${context.actionId}`,
+      reason: `CORRELATION_SCOPE_MISSING: evidence.correlationId is undefined/null. Evidence cannot be used for completion without explicit correlation association.`,
+    };
+  }
+  if (evidence.correlationId !== context.correlationId) {
+    return {
+      valid: false,
+      reason: `CORRELATION_SCOPE_MISMATCH: evidence.correlationId=${evidence.correlationId} !== context.correlationId=${context.correlationId}`,
     };
   }
 
-  // 3. TemporalScope: evidence.createdAt 必须 >= actionStartedAt（辅助约束）
+  // 4. TemporalScope: evidence.createdAt 必须 >= actionStartedAt（辅助约束）
   if (context.actionStartedAt && evidence.createdAt < context.actionStartedAt) {
     return {
       valid: false,
       reason: `TEMPORAL_SCOPE_INVALID: evidence.createdAt=${evidence.createdAt} < actionStartedAt=${context.actionStartedAt}`,
-    };
-  }
-
-  // 4. CorrelationScope: 如果 evidence 有 correlationId，必须匹配
-  if (evidence.correlationId && evidence.correlationId !== context.correlationId) {
-    return {
-      valid: false,
-      reason: `CORRELATION_SCOPE_MISMATCH: evidence.correlationId=${evidence.correlationId} !== context.correlationId=${context.correlationId}`,
     };
   }
 

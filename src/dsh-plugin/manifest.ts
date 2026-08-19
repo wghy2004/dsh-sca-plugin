@@ -43,10 +43,15 @@ export const SCA_DSH_PLUGIN_MANIFEST = {
     mission: {
       id: "career.mission",
       mode: "runtime",
+      // ⚠️ P1-4 Fix: Manifest must match declared capability surface.
+      // README declares: status / pause / cancel / approve / deny
+      // Previously missing: approve, deny
       operations: [
         "status",
         "pause",
         "cancel",
+        "approve",
+        "deny",
       ],
     },
   },

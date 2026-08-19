@@ -58,6 +58,8 @@ interface MissionCreatedPayload {
   input: unknown;
   correlationId: string;
   operationId: string;
+  /** ⚠️ P0-4 Fix: Mission target entity reference */
+  target?: { entityType: "JOB"; entityId: string };
   createdAt: number;
 }
 
@@ -132,6 +134,8 @@ export class SCAMissionRepository implements MissionRepository {
     input: unknown,
     correlationId: string,
     operationId: string,
+    /** ⚠️ P0-4 Fix: Optional target entity reference (e.g., jobId for JOB_APPLICATION) */
+    target?: { entityType: "JOB"; entityId: string },
   ): Promise<MissionRecord> {
     const missionId = generateMissionId();
     const now = Date.now();
@@ -144,6 +148,7 @@ export class SCAMissionRepository implements MissionRepository {
       input,
       correlationId,
       operationId,
+      target,
       createdAt: now,
     };
 
@@ -365,6 +370,8 @@ export class SCAMissionRepository implements MissionRepository {
             createdAt: payload.createdAt,
             updatedAt: payload.createdAt,
             input: payload.input,
+            // ⚠️ P0-4 Fix: Include target entity reference if present
+            target: (payload as any).target,
             correlationId: payload.correlationId,
             operationId: payload.operationId,
           };

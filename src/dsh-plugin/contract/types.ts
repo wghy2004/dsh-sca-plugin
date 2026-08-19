@@ -105,6 +105,22 @@ export interface Evidence<T = unknown> {
 
   createdAt: number;
   retractedAt?: number;
+
+  /**
+   * ⚠️ P1-3 Fix: Provenance chain for DERIVED Evidence.
+   *
+   * DERIVED Evidence must trace back to upstream OBSERVED/DERIVED Evidence.
+   * This forms a directed acyclic provenance graph:
+   *   OBSERVED → DERIVED → DERIVED → ...
+   *
+   * For DERIVED authority, this field MUST be non-empty and reference
+   * valid upstream Evidence IDs.
+   *
+   * Example:
+   *   DERIVED application.status=SUBMITTED
+   *     derivedFromEvidenceIds: ["obs_123_page_text"]  // OBSERVED page text
+   */
+  derivedFromEvidenceIds?: string[];
 }
 
 export interface CareerConstraint {
@@ -315,6 +331,25 @@ export interface VerificationResult {
 // MissionRecord —— 从"状态机"升级为"执行实例"
 // ============================================================
 
+/**
+ * ⚠️ P0-4 Fix: Mission / Job / Action Identity Separation.
+ *
+ * Mission = 用户发起的一次任务（意图身份）
+ * Job = 现实世界中的一个实体（现实实体身份）
+ * Action = 针对这个实体的一次行为（执行身份）
+ *
+ * 三者应该是：
+ *   Mission
+ *      └── target → Job
+ *                    └── Action
+ *
+ * 而不是 MissionId == JobId（把意图身份和现实实体身份混在一起）。
+ */
+export interface MissionTarget {
+  entityType: "JOB";
+  entityId: string; // jobId
+}
+
 export interface MissionRecord {
   id: string;
   kind: MissionKind;
@@ -323,6 +358,12 @@ export interface MissionRecord {
   updatedAt: number;
 
   input: unknown;
+
+  /**
+   * ⚠️ P0-4 Fix: Mission 的目标实体引用。
+   * 区分"意图身份"（Mission.id）和"现实实体身份"（target.entityId）。
+   */
+  target?: MissionTarget;
 
   checkpoint?: unknown;
 

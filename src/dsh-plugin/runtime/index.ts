@@ -19,7 +19,8 @@ export {
   mapInteractionStateToJob,
   mapInteractionStatesToJobs,
   extractJobMatchFromChain,
-  mapObservationToEvidence,
+  // ⚠️ P1-2 Fix: mapObservationToEvidence REMOVED — it bypassed Authority Gate.
+  // Use extractAuthorizedObservations() instead.
   mapInterpretationToEvidence,
   getEventsByChain,
   getRecentObservations,

@@ -74,6 +74,19 @@ export class CareerService {
   // Search —— 只读能力，不需要审批
   // ============================================================
 
+  /**
+   * ⚠️ P0-1 Fix: Search Completion is NOT the same as Apply Completion.
+   *
+   * Search completes when SearchResultCaptured (results exist), not when
+   * VerificationPassed. This is a different completion path for read-only missions.
+   *
+   * Flow:
+   *   CREATED → PLANNING → DISCOVERING → COLLECTING → EVALUATING → COMPLETED
+   *
+   * Completion invariant for JOB_SEARCH:
+   *   - Results must be non-empty OR explicitly empty (no jobs found)
+   *   - Evidence must have been collected (even if zero OBSERVED)
+   */
   async search(
     request: JobSearchRequest,
   ): Promise<JobSearchResult> {
@@ -112,6 +125,10 @@ export class CareerService {
 
     await this.transition(mission.id, "COLLECTING");
     await this.transition(mission.id, "EVALUATING");
+
+    // ⚠️ P0-1: Search completion does NOT require OBSERVED verification.
+    // It completes when results are captured (even if empty).
+    // This is a READ-ONLY completion path, separate from Apply's VERIFYING → COMPLETED.
     await this.transition(mission.id, "COMPLETED");
 
     return {
@@ -127,6 +144,19 @@ export class CareerService {
   // Inspect —— 只读能力，不需要审批
   // ============================================================
 
+  /**
+   * ⚠️ P0-1 Fix: Inspection Completion is NOT the same as Apply Completion.
+   *
+   * Inspection completes when InspectionResultCaptured (job details obtained), not when
+   * VerificationPassed. This is a different completion path for read-only missions.
+   *
+   * Flow:
+   *   CREATED → PLANNING → COLLECTING → EVALUATING → COMPLETED
+   *
+   * Completion invariant for JOB_INSPECTION:
+   *   - Job details must be captured (even if partial)
+   *   - Evidence may include OBSERVED (from page observation) or DERIVED (from interpretation)
+   */
   async inspect(
     request: JobInspectRequest,
   ): Promise<JobInspectResult> {
@@ -148,6 +178,10 @@ export class CareerService {
       );
 
     await this.transition(mission.id, "EVALUATING");
+
+    // ⚠️ P0-1: Inspection completion does NOT require OBSERVED verification.
+    // It completes when job details are captured.
+    // This is a READ-ONLY completion path, separate from Apply's VERIFYING → COMPLETED.
     await this.transition(mission.id, "COMPLETED");
 
     return {
@@ -217,6 +251,15 @@ export class CareerService {
       };
     }
 
+    // ⚠️ P0-4 Fix: Store jobId in checkpoint so execute/verify can retrieve it.
+    // This separates Mission identity (mission.id) from Job entity identity (request.jobId).
+    await this.missions.checkpoint(mission.id, {
+      jobId: request.jobId,
+      planId: preparation.planId,
+      resumeId: request.resumeId,
+      message: request.message,
+    });
+
     // Phase 2: Policy Gate
     const careerState =
       await this.deps.careerState.getCareerState();
@@ -258,6 +301,7 @@ export class CareerService {
         requestedAt: Date.now(),
       };
 
+      // ⚠️ P0-4 Fix: Store jobId in checkpoint for later retrieval by execute/verify.
       await this.missions.update(mission.id, {
         state: "AWAITING_APPROVAL",
         pendingApproval: {
@@ -265,8 +309,8 @@ export class CareerService {
           missionId: mission.id,
         },
         checkpoint: {
-          planId: preparation.planId,
           jobId: request.jobId,
+          planId: preparation.planId,
           resumeId: request.resumeId,
           message: request.message,
         },
@@ -384,6 +428,10 @@ export class CareerService {
   ) {
     await this.transition(missionId, "EXECUTING");
 
+    // ⚠️ P0-4 Fix: Read jobId from checkpoint for proper identity separation.
+    const mission = await this.missions.get(missionId);
+    const jobId = (mission?.checkpoint as any)?.jobId;
+
     const actionStart = Date.now();
     const action: MissionAction = {
       type: "JOB_APPLICATION",
@@ -414,7 +462,7 @@ export class CareerService {
 
       return {
         missionId,
-        jobId: (await this.missions.get(missionId))?.input as any,
+        jobId,
         state: "FAILED" as MissionState,
         verification: receipt.evidence,
         failure: {

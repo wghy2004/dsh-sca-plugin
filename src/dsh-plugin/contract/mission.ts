@@ -47,6 +47,8 @@ export interface MissionRepository {
     input: unknown,
     correlationId: string,
     operationId: string,
+    /** ⚠️ P0-4 Fix: Optional target entity reference */
+    target?: { entityType: "JOB"; entityId: string },
   ): Promise<MissionRecord>;
 
   get(id: string): Promise<MissionRecord | null>;
@@ -70,6 +72,7 @@ export class InMemoryMissionRepository implements MissionRepository {
     input: unknown,
     correlationId: string,
     operationId: string,
+    target?: { entityType: "JOB"; entityId: string },
   ): Promise<MissionRecord> {
     const now = Date.now();
 
@@ -80,6 +83,8 @@ export class InMemoryMissionRepository implements MissionRepository {
       createdAt: now,
       updatedAt: now,
       input,
+      // ⚠️ P0-4 Fix: Include target entity reference if present
+      target,
       correlationId,
       operationId,
     };
